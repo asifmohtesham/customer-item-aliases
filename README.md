@@ -62,7 +62,7 @@ Without this plugin, a FluxStore or FiboSearch query for `55012345` returns **ze
 
 ```bash
 cd wp-content/plugins
-git clone https://github.com/YOUR_USERNAME/customer-item-aliases.git
+git clone https://github.com/asifmohtesham/customer-item-aliases.git
 wp plugin activate customer-item-aliases
 ```
 
