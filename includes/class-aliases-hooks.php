@@ -9,13 +9,17 @@ defined( 'ABSPATH' ) || exit;
  *
  * ## Authentication model
  *
- * Rather than issuing one WC API key per customer (which does not scale),
- * the plugin uses a SINGLE shared API key (admin / service account) and
- * resolves the customer identity from an explicit `customer_id` request
- * parameter supplied by the FluxStore app at search time.
+ * A SINGLE shared WooCommerce API key (admin / service account) is used for
+ * all FluxStore requests. Customer identity is resolved transparently from the
+ * WordPress auth cookie that FluxStore already embeds in every authenticated
+ * request as the `User-Cookie` HTTP header (base64-encoded).
  *
- * Fallback: when `customer_id` is absent the current WordPress session user
- * is used instead (covers FiboSearch AJAX and other authenticated contexts).
+ * Resolution priority for /wc/v2|v3/products searches:
+ *   1. WordPress user resolved from `User-Cookie` header  ← FluxStore
+ *   2. Explicit `?customer_id=` query param               ← Postman / other clients
+ *   3. get_current_user_id()                              ← FiboSearch AJAX / session
+ *
+ * The `?customer_id` param is therefore OPTIONAL — FluxStore works without it.
  *
  * ## Multi-EAN support
  *
@@ -50,6 +54,11 @@ class CIA_Hooks {
 
     public static function init(): void {
 
+        // ── FluxStore: transparent cookie auth for WC REST product search ─────
+        // Must run early (priority 15) so current user is set before the
+        // woocommerce_rest_product_*_query hooks fire at priority 10.
+        add_filter( 'determine_current_user', [ __CLASS__, 'auth_via_user_cookie_header' ], 15 );
+
         // ── MStore API Scanner ─────────────────────────────────────────────────
         add_filter( 'rest_pre_dispatch', [ __CLASS__, 'resolve_in_scanner' ], 10, 3 );
 
@@ -71,15 +80,83 @@ class CIA_Hooks {
         add_action( 'init', [ __CLASS__, 'register_fibosearch_hook' ], 20 );
     }
 
+    // ── FluxStore cookie auth ─────────────────────────────────────────────────
+
+    /**
+     * Authenticate the current user from the `User-Cookie` HTTP header.
+     *
+     * FluxStore (via WooCommerceService / WooComerceConnector) does NOT attach
+     * the user cookie to WooCommerce REST requests — wcConnector.getAsync()
+     * only signs with consumer key/secret. However, for every authenticated
+     * MStore API call (orders, cart, scanner, etc.) FluxStore sends:
+     *
+     *   User-Cookie: base64( urlencode( <wp_auth_cookie> ) )
+     *
+     * MStore API decodes it as: urldecode( base64_decode( $header ) )
+     *
+     * This hook applies the same decoding to /wc/v2|v3/products requests so
+     * that alias resolution can identify the customer without any client-side
+     * changes and without issuing per-customer API keys.
+     *
+     * Only activates when:
+     *   - No user is already authenticated (e.g. by WC consumer key auth)
+     *   - The request targets a WooCommerce product search route
+     *   - A non-empty User-Cookie header is present
+     *   - The decoded cookie passes WordPress's own validation
+     *
+     * @param  int|false $user_id  User ID already resolved by earlier hooks, or 0/false.
+     * @return int|false           Resolved user ID, or the original value unchanged.
+     */
+    public static function auth_via_user_cookie_header( $user_id ) {
+        // Already authenticated — don't override.
+        if ( $user_id ) {
+            return $user_id;
+        }
+
+        // Only act on WooCommerce product search routes.
+        $request_uri = $_SERVER['REQUEST_URI'] ?? '';
+        if ( ! preg_match( '#/wc/(v[23]|store/v1)/products#', $request_uri ) ) {
+            return $user_id;
+        }
+
+        // Read the User-Cookie header (PHP converts hyphens → underscores).
+        $raw_header = $_SERVER['HTTP_USER_COOKIE'] ?? '';
+        if ( empty( $raw_header ) ) {
+            return $user_id;
+        }
+
+        // Decode: base64 → urldecode → WordPress auth cookie string.
+        $cookie = urldecode( base64_decode( $raw_header ) );
+        if ( empty( $cookie ) ) {
+            return $user_id;
+        }
+
+        // Parse the cookie to extract the username.
+        $parsed = wp_parse_auth_cookie( $cookie, 'logged_in' );
+        if ( empty( $parsed['username'] ) ) {
+            return $user_id;
+        }
+
+        // Verify the cookie is genuine — wp_validate_auth_cookie() checks the
+        // HMAC, expiry, and session token against the database.
+        if ( ! wp_validate_auth_cookie( $cookie, 'logged_in' ) ) {
+            return $user_id;
+        }
+
+        $user = get_user_by( 'login', $parsed['username'] );
+
+        return $user ? $user->ID : $user_id;
+    }
+
     // ── Core alias resolver ───────────────────────────────────────────────────
 
     /**
      * Resolves a search term to ALL matching EAN codes for the given customer.
      *
      * Customer identity resolution order:
-     *   1. Explicit $customer_id argument (from ?customer_id= request param)
-     *   2. get_current_user_id() — fallback for authenticated sessions
-     *      (FiboSearch AJAX, Store API with cookie auth, etc.)
+     *   1. User resolved from `User-Cookie` header (set by auth_via_user_cookie_header)
+     *   2. Explicit $customer_id argument (from ?customer_id= request param)
+     *   3. get_current_user_id() — fallback for FiboSearch AJAX / session auth
      *
      * Returns an empty array when:
      *   - No customer identity can be determined
@@ -109,8 +186,9 @@ class CIA_Hooks {
 
     /**
      * woocommerce_rest_product_query
-     * Fires for GET /wp-json/wc/v2/products?search=...&customer_id=...
+     * Fires for GET /wp-json/wc/v2/products?search=...
      * WC v2 stores the search term under 's' inside $args.
+     * ?customer_id= is supported as an optional override.
      */
     public static function resolve_in_rest_v2( array $args, WP_REST_Request $request ): array {
         $search      = sanitize_text_field( $args['s'] ?? $args['search'] ?? '' );
@@ -134,9 +212,10 @@ class CIA_Hooks {
 
     /**
      * woocommerce_rest_product_object_query
-     * Fires for GET /wp-json/wc/v3/products?search=...&customer_id=...
+     * Fires for GET /wp-json/wc/v3/products?search=...
      * WC v3 also stores the search term under 's' inside $args
      * (despite the URL param being named 'search').
+     * ?customer_id= is supported as an optional override.
      */
     public static function resolve_in_rest_v3( array $args, WP_REST_Request $request ): array {
         $search      = sanitize_text_field( $args['s'] ?? $args['search'] ?? '' );
@@ -160,8 +239,9 @@ class CIA_Hooks {
 
     /**
      * woocommerce_blocks_product_query_args
-     * Fires for GET /wp-json/wc/store/v1/products?search=...&customer_id=...
+     * Fires for GET /wp-json/wc/store/v1/products?search=...
      * Store API uses 's' (WP_Query convention) inside $args.
+     * ?customer_id= is supported as an optional override.
      */
     public static function resolve_in_store_api( array $args, WP_REST_Request $request ): array {
         $search      = sanitize_text_field( $args['s'] ?? $args['search'] ?? '' );
@@ -213,8 +293,8 @@ class CIA_Hooks {
      * and _sku but never _global_unique_id. We short-circuit with a full
      * product response when a match is found via EAN.
      *
-     * Scanner does not support customer_id param — identity comes from the
-     * token (which sets current user via validateCookieLogin).
+     * Scanner sends User-Cookie in its request, so MStore API sets the current
+     * user before this hook fires — get_current_user_id() returns the customer.
      */
     public static function resolve_in_scanner(
         $result,
@@ -294,7 +374,8 @@ class CIA_Hooks {
      *
      * Skips the cache entirely for any authenticated product search so that
      * alias resolution always runs against live data.
-     * Also skips when customer_id param is present, regardless of session.
+     * Also skips when User-Cookie header is present (FluxStore authenticated
+     * searches) or when customer_id param is explicitly provided.
      */
     public static function skip_cache_for_product_search(
         bool $skip,
@@ -306,16 +387,19 @@ class CIA_Hooks {
             return true;
         }
 
-        $route             = $request->get_route();
-        $has_search        = (bool) $request->get_param( 'search' );
-        $has_customer_id   = (bool) $request->get_param( 'customer_id' );
-        $is_authed         = is_user_logged_in();
-        $is_product_search = (bool) preg_match(
+        $route              = $request->get_route();
+        $has_search         = (bool) $request->get_param( 'search' );
+        $has_customer_id    = (bool) $request->get_param( 'customer_id' );
+        $has_user_cookie    = ! empty( $_SERVER['HTTP_USER_COOKIE'] );
+        $is_authed          = is_user_logged_in();
+        $is_product_search  = (bool) preg_match(
             '#^/wc/(v[23]|store/v1)/products$#',
             $route
         );
 
-        return $is_product_search && $has_search && ( $is_authed || $has_customer_id );
+        return $is_product_search
+            && $has_search
+            && ( $is_authed || $has_customer_id || $has_user_cookie );
     }
 
     // ── FiboSearch: late registration ─────────────────────────────────────────
