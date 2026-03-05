@@ -23,7 +23,7 @@ class CIA_DB {
             id          BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             user_id     BIGINT(20) UNSIGNED NOT NULL,
             alias_code  VARCHAR(100)        NOT NULL,
-            ean8_code   CHAR(8)             NOT NULL,
+            ean8_code   VARCHAR(50)         NOT NULL,
             created_at  DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             INDEX idx_user_alias (user_id, alias_code),
@@ -101,18 +101,39 @@ class CIA_DB {
     }
 
     /**
-     * Resolve a customer alias to its master EAN8.
+     * Resolve a customer alias to a single master EAN (first match).
+     * Kept for backward compatibility. Prefer resolve_aliases() for new code.
      */
     public static function resolve_alias( int $user_id, string $alias ): ?string {
+        $results = self::resolve_aliases( $user_id, $alias );
+        return $results[0] ?? null;
+    }
+
+    /**
+     * Resolve a customer alias to ALL matching EAN/item codes.
+     *
+     * One alias_code may be associated with multiple ean8_code rows for the
+     * same user — this method returns all of them so every matching product
+     * is included in the WooCommerce search result.
+     *
+     * @param  int    $user_id  WordPress user ID of the customer.
+     * @param  string $alias    The alias code submitted in the search query.
+     * @return string[]         Array of EAN/item code strings; empty if no match.
+     */
+    public static function resolve_aliases( int $user_id, string $alias ): array {
         global $wpdb;
-        return $wpdb->get_var(
+        return $wpdb->get_col(
             $wpdb->prepare(
-                "SELECT ean8_code FROM %i WHERE user_id = %d AND alias_code = %s LIMIT 1",
+                "SELECT ean8_code
+                 FROM %i
+                 WHERE user_id   = %d
+                   AND alias_code = %s
+                 ORDER BY id ASC",
                 self::table(),
                 $user_id,
                 $alias
             )
-        ) ?: null;
+        ) ?: [];
     }
 
     /**
@@ -156,8 +177,8 @@ class CIA_DB {
      */
     public static function delete( $ids ): void {
         global $wpdb;
-        $ids        = array_map( 'absint', (array) $ids );
-        $id_list    = implode( ',', $ids );
+        $ids     = array_map( 'absint', (array) $ids );
+        $id_list = implode( ',', $ids );
         $wpdb->query( "DELETE FROM " . self::table() . " WHERE id IN ({$id_list})" );
     }
 }
