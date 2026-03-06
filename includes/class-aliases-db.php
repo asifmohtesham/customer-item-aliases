@@ -6,22 +6,40 @@ class CIA_DB {
     /**
      * Returns the full prefixed table name.
      *
-     * The value is safe to interpolate directly into SQL: $wpdb->prefix is set
-     * by WordPress core, and CIA_TABLE_ALIAS is a plugin-defined constant —
-     * neither is user-supplied input. This is the same pattern WooCommerce
-     * uses for $wpdb->posts, $wpdb->postmeta, etc.
+     * Safe to interpolate directly into SQL: $wpdb->prefix is set by WordPress
+     * core and CIA_TABLE_ALIAS is a plugin constant — neither is user input.
+     * This is the same pattern WooCommerce uses for $wpdb->posts, etc.
      *
-     * NOTE: Do NOT use %i for the table name in prepare() calls. %i was added
-     * in WordPress 6.2 and silently returns null on older versions, causing
-     * every query to return an empty result with no error thrown.
+     * NOTE: Do NOT use %i for the table name in prepare(). %i was added in
+     * WordPress 6.2 and silently returns null on older versions.
      */
     public static function table(): string {
         global $wpdb;
         return $wpdb->prefix . CIA_TABLE_ALIAS;
     }
 
+    // -------------------------------------------------------------------------
+    // Schema management
+    // -------------------------------------------------------------------------
+
     /**
-     * Creates the table on plugin activation via dbDelta.
+     * Create (or upgrade) the alias table via dbDelta.
+     *
+     * dbDelta safely adds new columns to an existing table without removing or
+     * modifying existing ones, making it safe to call on every plugin upgrade.
+     *
+     * Columns:
+     *   is_active  (TINYINT 0/1, default 1) — soft-delete flag.
+     *              Disabled aliases are never resolved but remain in the DB
+     *              for audit history and can be re-enabled at any time.
+     *
+     *   expires_at (DATETIME, nullable)      — optional expiry timestamp.
+     *              NULL means the alias never expires. When a non-null value
+     *              is in the past, the alias is treated as inactive by all
+     *              resolvers regardless of the is_active flag.
+     *              Intentionally optional: fully backwards-compatible with
+     *              existing rows which will have NULL and behave identically
+     *              to before.
      */
     public static function create_table(): void {
         global $wpdb;
@@ -33,10 +51,13 @@ class CIA_DB {
             user_id     BIGINT(20) UNSIGNED NOT NULL,
             alias_code  VARCHAR(100)        NOT NULL,
             ean8_code   VARCHAR(50)         NOT NULL,
+            is_active   TINYINT(1)          NOT NULL DEFAULT 1,
+            expires_at  DATETIME                     DEFAULT NULL,
             created_at  DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             INDEX idx_user_alias (user_id, alias_code),
-            INDEX idx_ean8 (ean8_code)
+            INDEX idx_ean8       (ean8_code),
+            INDEX idx_active     (is_active)
         ) {$charset_collate};";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
@@ -46,7 +67,25 @@ class CIA_DB {
     }
 
     /**
-     * Fetch all rows for the list table (with pagination & sorting).
+     * Run DB migrations if the stored schema version is behind CIA_VERSION.
+     *
+     * Called on every `plugins_loaded` — exits immediately when already current
+     * so there is zero overhead on normal page loads.
+     */
+    public static function maybe_upgrade(): void {
+        if ( get_option( 'cia_db_version' ) === CIA_VERSION ) {
+            return;
+        }
+        self::create_table(); // dbDelta adds missing columns; never destructive
+    }
+
+    // -------------------------------------------------------------------------
+    // Admin list helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Fetch rows for the admin list table.
+     * Returns ALL rows (active and disabled) so admins can manage everything.
      */
     public static function get_rows( array $args = [] ): array {
         global $wpdb;
@@ -68,7 +107,7 @@ class CIA_DB {
 
         return $wpdb->get_results(
             $wpdb->prepare(
-                "SELECT id, user_id, alias_code, ean8_code, created_at
+                "SELECT id, user_id, alias_code, ean8_code, is_active, expires_at, created_at
                  FROM {$table} {$where}
                  ORDER BY {$orderby} {$order}
                  LIMIT %d OFFSET %d",
@@ -80,7 +119,7 @@ class CIA_DB {
     }
 
     /**
-     * Count total rows (for pagination).
+     * Count total rows (for pagination). Counts ALL rows regardless of status.
      */
     public static function count_rows( string $search = '' ): int {
         global $wpdb;
@@ -99,35 +138,37 @@ class CIA_DB {
     }
 
     /**
-     * Fetch a single row by ID.
+     * Fetch a single row by ID (admin use; no active/expiry filter).
      */
     public static function get_row( int $id ): ?array {
         global $wpdb;
         $table = self::table();
         return $wpdb->get_row(
-            $wpdb->prepare(
-                "SELECT * FROM {$table} WHERE id = %d",
-                $id
-            ),
+            $wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", $id ),
             ARRAY_A
         ) ?: null;
     }
 
+    // -------------------------------------------------------------------------
+    // Exact-match resolvers  (active + non-expired only)
+    //
+    // The shared active filter:
+    //   AND is_active = 1
+    //   AND (expires_at IS NULL OR expires_at > NOW())
+    //
+    // expires_at = NULL → never expires (fully backwards-compatible with rows
+    // that predate the column — they will also have NULL after the upgrade).
+    // -------------------------------------------------------------------------
+
     /**
-     * Resolve a customer alias to a single master EAN (first match).
-     * Kept for backward compatibility. Prefer resolve_aliases() for new code.
+     * Backward-compat wrapper: first EAN code for a customer alias.
      */
     public static function resolve_alias( int $user_id, string $alias ): ?string {
-        $results = self::resolve_aliases( $user_id, $alias );
-        return $results[0] ?? null;
+        return self::resolve_aliases( $user_id, $alias )[0] ?? null;
     }
 
-    // -------------------------------------------------------------------------
-    // Exact-match resolvers
-    // -------------------------------------------------------------------------
-
     /**
-     * Exact match: resolve a customer alias to ALL EAN codes for a specific user.
+     * Exact match: all active, non-expired EAN codes for a customer alias.
      *
      * @param  int    $user_id
      * @param  string $alias
@@ -143,6 +184,8 @@ class CIA_DB {
                  FROM {$table}
                  WHERE user_id    = %d
                    AND alias_code = %s
+                   AND is_active  = 1
+                   AND (expires_at IS NULL OR expires_at > NOW())
                  ORDER BY id ASC",
                 $user_id,
                 $alias
@@ -151,9 +194,8 @@ class CIA_DB {
     }
 
     /**
-     * Exact match: resolve an alias to ALL EAN codes across ALL customers.
-     *
-     * Used as the first resolution attempt for admin searches.
+     * Exact match: all active, non-expired EAN codes across ALL customers.
+     * Used for admin searches.
      *
      * @param  string $alias
      * @return string[]
@@ -167,6 +209,8 @@ class CIA_DB {
                 "SELECT DISTINCT ean8_code
                  FROM {$table}
                  WHERE alias_code = %s
+                   AND is_active  = 1
+                   AND (expires_at IS NULL OR expires_at > NOW())
                  ORDER BY ean8_code ASC",
                 $alias
             )
@@ -175,20 +219,16 @@ class CIA_DB {
 
     // -------------------------------------------------------------------------
     // LIKE (partial) fallback resolvers
-    // Used when exact match returns no results.
-    // Pattern: contains (%search%) — handles prefix, suffix, and mid-code entry.
+    // Called only when exact match returns empty.
+    // Pattern: %search% (contains) for maximum flexibility.
     // -------------------------------------------------------------------------
 
     /**
-     * Partial match: resolve aliases containing the search string for a specific user.
-     *
-     * Called as a fallback when resolve_aliases() returns empty, so that a
-     * customer typing a partial code (e.g. "50123" instead of "5012345") still
-     * gets results.
+     * Partial match: active, non-expired aliases containing the term, scoped to one customer.
      *
      * @param  int    $user_id
-     * @param  string $alias    Partial or full alias code.
-     * @return string[]         Deduplicated EAN codes ordered by first occurrence.
+     * @param  string $alias
+     * @return string[]
      */
     public static function resolve_aliases_like( int $user_id, string $alias ): array {
         global $wpdb;
@@ -201,6 +241,8 @@ class CIA_DB {
                  FROM {$table}
                  WHERE user_id    = %d
                    AND alias_code LIKE %s
+                   AND is_active  = 1
+                   AND (expires_at IS NULL OR expires_at > NOW())
                  ORDER BY ean8_code ASC",
                 $user_id,
                 $pattern
@@ -209,14 +251,11 @@ class CIA_DB {
     }
 
     /**
-     * Partial match: resolve aliases containing the search string across ALL customers.
+     * Partial match: active, non-expired aliases containing the term, across ALL customers.
+     * Used as fallback for admin searches.
      *
-     * Called as a fallback when resolve_aliases_global() returns empty, so that
-     * an admin typing a partial alias code (e.g. "50123") still sees all
-     * products whose alias contains that string, regardless of customer.
-     *
-     * @param  string $alias    Partial or full alias code.
-     * @return string[]         Deduplicated EAN codes ordered alphabetically.
+     * @param  string $alias
+     * @return string[]
      */
     public static function resolve_aliases_global_like( string $alias ): array {
         global $wpdb;
@@ -228,6 +267,8 @@ class CIA_DB {
                 "SELECT DISTINCT ean8_code
                  FROM {$table}
                  WHERE alias_code LIKE %s
+                   AND is_active  = 1
+                   AND (expires_at IS NULL OR expires_at > NOW())
                  ORDER BY ean8_code ASC",
                 $pattern
             )
@@ -240,40 +281,77 @@ class CIA_DB {
 
     /**
      * Insert a new alias record.
+     *
+     * @param array $data {
+     *   int         $user_id
+     *   string      $alias_code
+     *   string      $ean8_code
+     *   int         $is_active   Optional. Defaults to 1 (active).
+     *   string|null $expires_at  Optional. MySQL datetime or null.
+     * }
      */
     public static function insert( array $data ): bool {
         global $wpdb;
+
+        $row = [
+            'user_id'    => absint( $data['user_id'] ),
+            'alias_code' => sanitize_text_field( $data['alias_code'] ),
+            'ean8_code'  => sanitize_text_field( $data['ean8_code'] ),
+            'is_active'  => isset( $data['is_active'] ) ? (int) $data['is_active'] : 1,
+            'expires_at' => $data['expires_at'] ?? null,
+        ];
+
         return (bool) $wpdb->insert(
             self::table(),
-            [
-                'user_id'    => absint( $data['user_id'] ),
-                'alias_code' => sanitize_text_field( $data['alias_code'] ),
-                'ean8_code'  => sanitize_text_field( $data['ean8_code'] ),
-            ],
-            [ '%d', '%s', '%s' ]
+            $row,
+            [ '%d', '%s', '%s', '%d', '%s' ]
         );
     }
 
     /**
      * Update an existing alias record.
+     *
+     * Passing expires_at = null explicitly clears the expiry date.
      */
     public static function update( int $id, array $data ): bool {
         global $wpdb;
+
+        $row = [
+            'user_id'    => absint( $data['user_id'] ),
+            'alias_code' => sanitize_text_field( $data['alias_code'] ),
+            'ean8_code'  => sanitize_text_field( $data['ean8_code'] ),
+            'is_active'  => isset( $data['is_active'] ) ? (int) $data['is_active'] : 1,
+            'expires_at' => $data['expires_at'] ?? null,
+        ];
+
         return (bool) $wpdb->update(
             self::table(),
-            [
-                'user_id'    => absint( $data['user_id'] ),
-                'alias_code' => sanitize_text_field( $data['alias_code'] ),
-                'ean8_code'  => sanitize_text_field( $data['ean8_code'] ),
-            ],
+            $row,
             [ 'id' => $id ],
-            [ '%d', '%s', '%s' ],
+            [ '%d', '%s', '%s', '%d', '%s' ],
             [ '%d' ]
         );
     }
 
     /**
-     * Delete one or multiple alias records.
+     * Enable or disable a single alias record (soft-delete toggle).
+     *
+     * @param  int  $id      Alias record ID.
+     * @param  bool $active  true = enable, false = disable.
+     */
+    public static function set_active( int $id, bool $active ): bool {
+        global $wpdb;
+        return (bool) $wpdb->update(
+            self::table(),
+            [ 'is_active' => $active ? 1 : 0 ],
+            [ 'id'        => $id ],
+            [ '%d' ],
+            [ '%d' ]
+        );
+    }
+
+    /**
+     * Delete one or multiple alias records (hard delete).
      *
      * @param int|int[] $ids
      */
