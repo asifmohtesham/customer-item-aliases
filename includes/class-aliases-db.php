@@ -5,6 +5,15 @@ class CIA_DB {
 
     /**
      * Returns the full prefixed table name.
+     *
+     * The value is safe to interpolate directly into SQL: $wpdb->prefix is set
+     * by WordPress core, and CIA_TABLE_ALIAS is a plugin-defined constant —
+     * neither is user-supplied input. This is the same pattern WooCommerce
+     * uses for $wpdb->posts, $wpdb->postmeta, etc.
+     *
+     * NOTE: Do NOT use %i for the table name in prepare() calls. %i was added
+     * in WordPress 6.2 and silently returns null on older versions, causing
+     * every query to return an empty result with no error thrown.
      */
     public static function table(): string {
         global $wpdb;
@@ -94,8 +103,12 @@ class CIA_DB {
      */
     public static function get_row( int $id ): ?array {
         global $wpdb;
+        $table = self::table();
         return $wpdb->get_row(
-            $wpdb->prepare( "SELECT * FROM %i WHERE id = %d", self::table(), $id ),
+            $wpdb->prepare(
+                "SELECT * FROM {$table} WHERE id = %d",
+                $id
+            ),
             ARRAY_A
         ) ?: null;
     }
@@ -122,14 +135,15 @@ class CIA_DB {
      */
     public static function resolve_aliases( int $user_id, string $alias ): array {
         global $wpdb;
+        $table = self::table(); // safe: prefix + plugin constant, not user input
+
         return $wpdb->get_col(
             $wpdb->prepare(
                 "SELECT ean8_code
-                 FROM %i
-                 WHERE user_id   = %d
+                 FROM {$table}
+                 WHERE user_id    = %d
                    AND alias_code = %s
                  ORDER BY id ASC",
-                self::table(),
                 $user_id,
                 $alias
             )
@@ -177,8 +191,9 @@ class CIA_DB {
      */
     public static function delete( $ids ): void {
         global $wpdb;
+        $table   = self::table();
         $ids     = array_map( 'absint', (array) $ids );
         $id_list = implode( ',', $ids );
-        $wpdb->query( "DELETE FROM " . self::table() . " WHERE id IN ({$id_list})" );
+        $wpdb->query( "DELETE FROM {$table} WHERE id IN ({$id_list})" );
     }
 }
