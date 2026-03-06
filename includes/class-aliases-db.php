@@ -123,7 +123,7 @@ class CIA_DB {
     }
 
     /**
-     * Resolve a customer alias to ALL matching EAN/item codes.
+     * Resolve a customer alias to ALL matching EAN/item codes for a specific user.
      *
      * One alias_code may be associated with multiple ean8_code rows for the
      * same user — this method returns all of them so every matching product
@@ -135,7 +135,7 @@ class CIA_DB {
      */
     public static function resolve_aliases( int $user_id, string $alias ): array {
         global $wpdb;
-        $table = self::table(); // safe: prefix + plugin constant, not user input
+        $table = self::table();
 
         return $wpdb->get_col(
             $wpdb->prepare(
@@ -145,6 +145,32 @@ class CIA_DB {
                    AND alias_code = %s
                  ORDER BY id ASC",
                 $user_id,
+                $alias
+            )
+        ) ?: [];
+    }
+
+    /**
+     * Resolve an alias to ALL matching EAN/item codes across ALL customers.
+     *
+     * Used for administrator searches: an admin is not scoped to a single
+     * customer, so we return every distinct EAN mapped to the alias_code
+     * regardless of which customer owns the record. This allows admins to
+     * search by any customer alias and see all associated products.
+     *
+     * @param  string   $alias  The alias code submitted in the search query.
+     * @return string[]         Distinct EAN/item code strings; empty if no match.
+     */
+    public static function resolve_aliases_global( string $alias ): array {
+        global $wpdb;
+        $table = self::table();
+
+        return $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT DISTINCT ean8_code
+                 FROM {$table}
+                 WHERE alias_code = %s
+                 ORDER BY ean8_code ASC",
                 $alias
             )
         ) ?: [];

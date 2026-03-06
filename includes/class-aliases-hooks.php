@@ -24,6 +24,14 @@ defined( 'ABSPATH' ) || exit;
  *      WordPress user ID as 'user_id' on every product query. This is the
  *      primary identity signal for FluxStore product searches.
  *
+ * ## Admin alias search
+ *
+ * Administrators and shop managers are NOT restricted to their own aliases.
+ * When an admin searches for an alias code, ALL EAN/item codes mapped to
+ * that alias across ALL customers are resolved via CIA_DB::resolve_aliases_global()
+ * so the admin sees every product associated with the alias, regardless of
+ * which customer owns the record.
+ *
  * ## FluxStore search pathways
  *
  * FluxStore issues TWO separate requests for every search:
@@ -72,8 +80,7 @@ class CIA_Hooks {
         // ── MStore API Scanner ─────────────────────────────────────────────────
         add_filter( 'rest_pre_dispatch', [ __CLASS__, 'resolve_in_scanner' ], 10, 3 );
 
-        // ── wp-rest-cache: skip reading AND writing cached responses for ──────
-        // ── authenticated product searches (alias resolution is user-specific) ─
+        // ── wp-rest-cache: skip reading AND writing cached responses ───────────
         add_filter( 'wp_rest_cache/skip_caching', [ __CLASS__, 'skip_cache_for_product_search' ], 10, 3 );
         add_filter( 'wp_rest_cache/skip_cache',   [ __CLASS__, 'skip_cache_for_product_search' ], 10, 3 );
 
@@ -90,17 +97,10 @@ class CIA_Hooks {
         add_action( 'init', [ __CLASS__, 'register_fibosearch_hook' ], 20 );
     }
 
-    // ── Customer identity resolution ────────────────────────────────────────────
+    // ── Customer identity resolution ───────────────────────────────────────────
 
     /**
      * Decode the FluxStore `User-Cookie` HTTP header into a WordPress user ID.
-     *
-     * FluxStore encodes the WordPress auth cookie as:
-     *   User-Cookie: base64( urlencode( <wp_logged_in_cookie> ) )
-     *
-     * NOTE: wcConnector.getAsync() does NOT attach this header — it is only
-     * present on MStore API calls (orders, cart, scanner). For product
-     * searches the user_id param (signal 3) is the reliable identity source.
      *
      * @return int|null  Validated customer user ID, or null if absent / invalid.
      */
@@ -125,44 +125,31 @@ class CIA_Hooks {
         }
 
         $user = get_user_by( 'login', $parsed['username'] );
-
         return $user ? $user->ID : null;
     }
 
     /**
      * Determine the customer ID for a WooCommerce REST product request.
      *
-     * Tries three signals in priority order and returns the first non-zero
-     * result. Returning null causes resolve() to fall back to the session
-     * user (FiboSearch / browser context).
-     *
      * Priority:
      *   1. User-Cookie header — cryptographically validated WordPress cookie.
-     *      Present on scanner / order / cart calls. Absent on product search.
-     *
      *   2. ?customer_id= param — explicit override for Postman / API testing.
-     *
-     *   3. ?user_id= param — FluxStore passes the logged-in customer's
-     *      WordPress user ID as 'user_id' on every product query. This is the
-     *      primary signal for all FluxStore product searches.
+     *   3. ?user_id= param — FluxStore's standard product query identity signal.
      *
      * @param  WP_REST_Request $request
      * @return int|null
      */
     private static function customer_id_for_request( WP_REST_Request $request ): ?int {
-        // 1. User-Cookie header.
         $from_cookie = self::get_customer_id_from_user_cookie();
         if ( $from_cookie ) {
             return $from_cookie;
         }
 
-        // 2. Explicit customer_id param (Postman / testing).
         $from_customer_id = absint( $request->get_param( 'customer_id' ) ?? 0 );
         if ( $from_customer_id ) {
             return $from_customer_id;
         }
 
-        // 3. user_id param — FluxStore's standard product query identity signal.
         $from_user_id = absint( $request->get_param( 'user_id' ) ?? 0 );
         if ( $from_user_id ) {
             return $from_user_id;
@@ -171,21 +158,27 @@ class CIA_Hooks {
         return null;
     }
 
-    // ── Core alias resolver ───────────────────────────────────────────────────
+    // ── Core alias resolver ────────────────────────────────────────────────────
 
     /**
-     * Resolves a search term to ALL matching EAN codes for a customer.
+     * Resolves a search term to ALL matching EAN codes.
      *
-     * Admin / shop-manager bypass always applies regardless of the identity
-     * source: if the resolved user has manage_woocommerce or manage_options,
-     * alias resolution is skipped and the original search term is used as-is.
-     * This correctly handles:
-     *   - Admin testing from FluxStore (user_id=1 → admin bypass → normal search)
-     *   - Service-account OAuth consumer key (current_user=1 → admin bypass)
-     *   - Real customers (user_id=3 → no admin role → alias resolved)
+     * Resolution strategy by user type:
+     *
+     *   Administrator / shop manager:
+     *     → CIA_DB::resolve_aliases_global( $search )
+     *     → Returns DISTINCT EAN codes across ALL customers for the alias.
+     *     → Allows admins to search any customer alias and find all products.
+     *
+     *   Regular customer:
+     *     → CIA_DB::resolve_aliases( $user_id, $search )
+     *     → Returns EAN codes scoped to that customer only.
+     *
+     *   No identity resolved:
+     *     → Returns [] so WooCommerce falls back to normal keyword search.
      *
      * @param  string   $search       Raw search / SKU term from the query args.
-     * @param  int|null $customer_id  Customer ID from cookie, param, or user_id.
+     * @param  int|null $customer_id  User ID from cookie, param, or user_id param.
      * @return string[]               All matching EAN codes; empty = no resolution.
      */
     private static function resolve( string $search, ?int $customer_id = null ): array {
@@ -195,28 +188,23 @@ class CIA_Hooks {
             return [];
         }
 
-        // Admins and shop managers search freely — no alias substitution.
+        // Admins and shop managers: global alias lookup across all customers.
         if ( user_can( $user_id, 'manage_woocommerce' ) || user_can( $user_id, 'manage_options' ) ) {
-            return [];
+            return CIA_DB::resolve_aliases_global( $search );
         }
 
+        // Regular customers: scoped to their own aliases only.
         return CIA_DB::resolve_aliases( $user_id, $search );
     }
 
-    // ── Search term extraction ───────────────────────────────────────────────
+    // ── Search term extraction ─────────────────────────────────────────────────
 
     /**
      * Extract the alias-candidate search term from WP_Query args.
      *
      * FluxStore issues two separate product search requests:
      *   • Text search : args['s']   (from ?search=<term>)
-     *   • SKU search  : args['sku'] (from ?sku=<term>, via kSearchConfig.enableSkuSearch)
-     *
-     * Both carry the same user-typed value and both must be intercepted so
-     * that alias resolution fires on whichever pathway is active.
-     *
-     * @param  array $args  WP_Query args as received by the REST hook.
-     * @return string       The search term, or an empty string if not found.
+     *   • SKU search  : args['sku'] (from ?sku=<term>)
      */
     private static function extract_search_term( array $args ): string {
         return sanitize_text_field(
@@ -225,16 +213,16 @@ class CIA_Hooks {
     }
 
     /**
-     * Remove all search / SKU keys from WP_Query args.
-     * Called before injecting the meta_query so WooCommerce does not also
-     * run a text search or _sku meta match on the alias code.
+     * Remove all search / SKU keys from WP_Query args before injecting
+     * the meta_query so WooCommerce does not also run a parallel text or
+     * _sku match on the alias code.
      */
     private static function clear_search_args( array $args ): array {
         unset( $args['s'], $args['search'], $args['sku'] );
         return $args;
     }
 
-    // ── Handler: WC REST API v2 ───────────────────────────────────────────────
+    // ── Handler: WC REST API v2 ────────────────────────────────────────────────
 
     public static function resolve_in_rest_v2( array $args, WP_REST_Request $request ): array {
         $search      = self::extract_search_term( $args );
@@ -254,15 +242,8 @@ class CIA_Hooks {
         return $args;
     }
 
-    // ── Handler: WC REST API v3 ───────────────────────────────────────────────
+    // ── Handler: WC REST API v3 ────────────────────────────────────────────────
 
-    /**
-     * woocommerce_rest_product_object_query
-     *
-     * Intercepts BOTH FluxStore search pathways:
-     *   • ?search=5012345 → args['s'] = '5012345'  (text search path)
-     *   • ?sku=5012345    → args['sku'] = '5012345' (SKU search path)
-     */
     public static function resolve_in_rest_v3( array $args, WP_REST_Request $request ): array {
         $search      = self::extract_search_term( $args );
         $customer_id = self::customer_id_for_request( $request );
@@ -281,7 +262,7 @@ class CIA_Hooks {
         return $args;
     }
 
-    // ── Handler: WooCommerce Store API ────────────────────────────────────────
+    // ── Handler: WooCommerce Store API ─────────────────────────────────────────
 
     public static function resolve_in_store_api( array $args, WP_REST_Request $request ): array {
         $search      = self::extract_search_term( $args );
@@ -301,12 +282,11 @@ class CIA_Hooks {
         return $args;
     }
 
-    // ── Handler: FiboSearch Pro ───────────────────────────────────────────────
+    // ── Handler: FiboSearch Pro ────────────────────────────────────────────────
 
     /**
      * dgwt/wcas/search_query
-     * FiboSearch is browser-based; no request object is available here.
-     * Falls back to session user via get_current_user_id() inside resolve().
+     * FiboSearch is browser-based; session user is available via get_current_user_id().
      * Returns only the first EAN — FiboSearch only accepts a single string.
      */
     public static function resolve_in_fibosearch( string $search_query ): string {
@@ -316,19 +296,22 @@ class CIA_Hooks {
             return $search_query;
         }
 
-        // User-Cookie may be present in browser-initiated requests.
         $customer_id = self::get_customer_id_from_user_cookie();
         $ean_codes   = self::resolve( $search, $customer_id );
 
         return $ean_codes[0] ?? $search_query;
     }
 
-    // ── Handler: MStore API Scanner ───────────────────────────────────────────
+    // ── Handler: MStore API Scanner ────────────────────────────────────────────
 
     /**
-     * rest_pre_dispatch — intercepts /api/flutter_woo/scanner before MStore
-     * API handles it. MStore validates User-Cookie and calls wp_set_current_user()
-     * before dispatch, so get_current_user_id() returns the correct customer.
+     * rest_pre_dispatch — intercepts /api/flutter_woo/scanner.
+     *
+     * MStore validates User-Cookie and calls wp_set_current_user() before
+     * dispatch, so get_current_user_id() already returns the correct user.
+     *
+     * Admin behaviour: resolves the alias globally across all customers so
+     * the admin scanner can find any product by any customer alias.
      */
     public static function resolve_in_scanner(
         $result,
@@ -346,20 +329,23 @@ class CIA_Hooks {
         }
 
         $user_id = get_current_user_id();
-
-        if ( $user_id && (
+        $is_admin = $user_id && (
             user_can( $user_id, 'manage_woocommerce' ) ||
             user_can( $user_id, 'manage_options' )
-        ) ) {
-            return $result;
+        );
+
+        // Resolve alias → EAN codes.
+        // Admins get a global lookup; customers get their own aliases only.
+        if ( $is_admin ) {
+            $ean_codes = CIA_DB::resolve_aliases_global( $raw_data );
+        } elseif ( $user_id ) {
+            $ean_codes = CIA_DB::resolve_aliases( $user_id, $raw_data );
+        } else {
+            $ean_codes = [];
         }
 
-        $ean_codes = $user_id
-            ? CIA_DB::resolve_aliases( $user_id, $raw_data )
-            : [ $raw_data ];
-
         if ( empty( $ean_codes ) ) {
-            $ean_codes = [ $raw_data ];
+            $ean_codes = [ $raw_data ]; // no alias — try raw value as EAN directly
         }
 
         global $wpdb;
@@ -396,7 +382,7 @@ class CIA_Hooks {
         ] );
     }
 
-    // ── wp-rest-cache exclusion ───────────────────────────────────────────────
+    // ── wp-rest-cache exclusion ────────────────────────────────────────────────
 
     public static function skip_cache_for_product_search(
         bool $skip,
@@ -425,7 +411,7 @@ class CIA_Hooks {
             && ( $is_authed || $has_customer_id || $has_user_id || $has_user_cookie );
     }
 
-    // ── FiboSearch: late registration ─────────────────────────────────────────
+    // ── FiboSearch: late registration ──────────────────────────────────────────
 
     public static function register_fibosearch_hook(): void {
         if ( has_filter( 'dgwt/wcas/search_query' ) || self::is_fibosearch_active() ) {
@@ -439,15 +425,11 @@ class CIA_Hooks {
                function_exists( 'dgwt_wcas' );
     }
 
-    // ── Shared utility ────────────────────────────────────────────────────────
+    // ── Shared utility ─────────────────────────────────────────────────────────
 
     /**
      * Injects an exact EAN meta_query into the WP_Query args.
      * Uses '=' for a single EAN and 'IN' for multiple.
-     *
-     * @param  array    $args
-     * @param  string[] $ean_codes
-     * @return array
      */
     private static function apply_exact_ean_match( array $args, array $ean_codes ): array {
         $args['meta_query']   = $args['meta_query'] ?? [];
