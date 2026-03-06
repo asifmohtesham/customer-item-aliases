@@ -122,16 +122,16 @@ class CIA_DB {
         return $results[0] ?? null;
     }
 
+    // -------------------------------------------------------------------------
+    // Exact-match resolvers
+    // -------------------------------------------------------------------------
+
     /**
-     * Resolve a customer alias to ALL matching EAN/item codes for a specific user.
+     * Exact match: resolve a customer alias to ALL EAN codes for a specific user.
      *
-     * One alias_code may be associated with multiple ean8_code rows for the
-     * same user — this method returns all of them so every matching product
-     * is included in the WooCommerce search result.
-     *
-     * @param  int    $user_id  WordPress user ID of the customer.
-     * @param  string $alias    The alias code submitted in the search query.
-     * @return string[]         Array of EAN/item code strings; empty if no match.
+     * @param  int    $user_id
+     * @param  string $alias
+     * @return string[]
      */
     public static function resolve_aliases( int $user_id, string $alias ): array {
         global $wpdb;
@@ -151,15 +151,12 @@ class CIA_DB {
     }
 
     /**
-     * Resolve an alias to ALL matching EAN/item codes across ALL customers.
+     * Exact match: resolve an alias to ALL EAN codes across ALL customers.
      *
-     * Used for administrator searches: an admin is not scoped to a single
-     * customer, so we return every distinct EAN mapped to the alias_code
-     * regardless of which customer owns the record. This allows admins to
-     * search by any customer alias and see all associated products.
+     * Used as the first resolution attempt for admin searches.
      *
-     * @param  string   $alias  The alias code submitted in the search query.
-     * @return string[]         Distinct EAN/item code strings; empty if no match.
+     * @param  string $alias
+     * @return string[]
      */
     public static function resolve_aliases_global( string $alias ): array {
         global $wpdb;
@@ -175,6 +172,71 @@ class CIA_DB {
             )
         ) ?: [];
     }
+
+    // -------------------------------------------------------------------------
+    // LIKE (partial) fallback resolvers
+    // Used when exact match returns no results.
+    // Pattern: contains (%search%) — handles prefix, suffix, and mid-code entry.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Partial match: resolve aliases containing the search string for a specific user.
+     *
+     * Called as a fallback when resolve_aliases() returns empty, so that a
+     * customer typing a partial code (e.g. "50123" instead of "5012345") still
+     * gets results.
+     *
+     * @param  int    $user_id
+     * @param  string $alias    Partial or full alias code.
+     * @return string[]         Deduplicated EAN codes ordered by first occurrence.
+     */
+    public static function resolve_aliases_like( int $user_id, string $alias ): array {
+        global $wpdb;
+        $table   = self::table();
+        $pattern = '%' . $wpdb->esc_like( $alias ) . '%';
+
+        return $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT DISTINCT ean8_code
+                 FROM {$table}
+                 WHERE user_id    = %d
+                   AND alias_code LIKE %s
+                 ORDER BY ean8_code ASC",
+                $user_id,
+                $pattern
+            )
+        ) ?: [];
+    }
+
+    /**
+     * Partial match: resolve aliases containing the search string across ALL customers.
+     *
+     * Called as a fallback when resolve_aliases_global() returns empty, so that
+     * an admin typing a partial alias code (e.g. "50123") still sees all
+     * products whose alias contains that string, regardless of customer.
+     *
+     * @param  string $alias    Partial or full alias code.
+     * @return string[]         Deduplicated EAN codes ordered alphabetically.
+     */
+    public static function resolve_aliases_global_like( string $alias ): array {
+        global $wpdb;
+        $table   = self::table();
+        $pattern = '%' . $wpdb->esc_like( $alias ) . '%';
+
+        return $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT DISTINCT ean8_code
+                 FROM {$table}
+                 WHERE alias_code LIKE %s
+                 ORDER BY ean8_code ASC",
+                $pattern
+            )
+        ) ?: [];
+    }
+
+    // -------------------------------------------------------------------------
+    // Write operations
+    // -------------------------------------------------------------------------
 
     /**
      * Insert a new alias record.
