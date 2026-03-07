@@ -7,7 +7,10 @@ class CIA_Admin {
         add_action( 'admin_menu',    [ __CLASS__, 'register_menu'  ] );
         add_action( 'admin_init',    [ __CLASS__, 'handle_actions' ] );
         add_action( 'admin_notices', [ __CLASS__, 'admin_notices'  ] );
+
+        // AJAX — authenticated admin users only (no nopriv variant needed)
         add_action( 'wp_ajax_cia_search_customers', [ __CLASS__, 'ajax_search_customers' ] );
+        add_action( 'wp_ajax_cia_check_alias',      [ __CLASS__, 'ajax_check_alias'      ] );
     }
 
     // -------------------------------------------------------------------------
@@ -52,6 +55,58 @@ class CIA_Admin {
     }
 
     // -------------------------------------------------------------------------
+    // AJAX: Real-time duplicate / conflict check
+    // -------------------------------------------------------------------------
+
+    /**
+     * Checks for duplicate or conflicting alias mappings while the admin
+     * fills in the Add/Edit form. Called on every keystroke (debounced 500ms).
+     *
+     * Request params (POST):
+     *   user_id    — customer's WordPress user ID
+     *   alias_code — alias being entered
+     *   ean8_code  — EAN being entered (may be partial/empty)
+     *   id         — current row ID when editing (0 when adding)
+     *
+     * Response JSON:
+     * {
+     *   "exact_duplicate":   false,          // identical triple already exists
+     *   "existing_mappings": [               // other EANs for same alias+customer
+     *     { "id": 5, "ean8_code": "30000070", "is_active": "1", "expires_at": null }
+     *   ]
+     * }
+     */
+    public static function ajax_check_alias(): void {
+        check_ajax_referer( 'cia_check_alias', 'nonce' );
+
+        if ( ! current_user_can( 'manage_woocommerce' ) ) {
+            wp_send_json_error( 'Unauthorized', 403 );
+        }
+
+        $user_id    = absint( $_POST['user_id']    ?? 0 );
+        $alias_code = sanitize_text_field( $_POST['alias_code'] ?? '' );
+        $ean8_code  = sanitize_text_field( $_POST['ean8_code']  ?? '' );
+        $exclude_id = absint( $_POST['id']         ?? 0 );
+
+        // Need at least user + alias to run a meaningful check
+        if ( ! $user_id || $alias_code === '' ) {
+            wp_send_json( [ 'exact_duplicate' => false, 'existing_mappings' => [] ] );
+            return;
+        }
+
+        $exact    = $ean8_code !== ''
+            ? CIA_DB::find_exact_duplicate( $user_id, $alias_code, $ean8_code, $exclude_id )
+            : null;
+
+        $mappings = CIA_DB::find_alias_mappings( $user_id, $alias_code, $exclude_id );
+
+        wp_send_json( [
+            'exact_duplicate'   => ! empty( $exact ),
+            'existing_mappings' => $mappings,
+        ] );
+    }
+
+    // -------------------------------------------------------------------------
     // Menu
     // -------------------------------------------------------------------------
 
@@ -78,13 +133,13 @@ class CIA_Admin {
         if ( $page !== 'cia-aliases' ) return;
         if ( ! current_user_can( 'manage_woocommerce' ) ) wp_die( 'Unauthorized' );
 
-        // --- CSV Export (streams file, exits) ---
+        // --- CSV Export ---
         if ( $action === 'export' ) {
             check_admin_referer( 'cia_export' );
             self::stream_export_csv( absint( $_GET['customer_id'] ?? 0 ) );
         }
 
-        // --- Template download (streams file, exits) ---
+        // --- Template download ---
         if ( $action === 'download_template' ) {
             check_admin_referer( 'cia_export' );
             self::stream_template_csv();
@@ -137,34 +192,48 @@ class CIA_Admin {
                 'expires_at' => $expires_raw ? date( 'Y-m-d H:i:s', strtotime( $expires_raw ) ) : null,
             ];
 
-            if ( ! $data['user_id'] )                          self::redirect( 'no_user' );
+            if ( ! $data['user_id'] )                              self::redirect( 'no_user' );
             if ( ! preg_match( '/^\d{8}$/', $data['ean8_code'] ) ) self::redirect( 'invalid_ean8' );
 
+            // ── Guard 1: Block exact duplicates ──────────────────────────────────────
+            // An exact (user_id, alias_code, ean8_code) triple must be unique.
+            // $id is passed so a row being edited doesn't flag itself.
+            $duplicate = CIA_DB::find_exact_duplicate(
+                $data['user_id'],
+                $data['alias_code'],
+                $data['ean8_code'],
+                $id
+            );
+            if ( $duplicate ) {
+                self::redirect( 'duplicate_alias' );
+            }
+
+            // ── Guard 2: Detect multi-EAN alias (warn, but allow) ───────────────
+            // If other EAN mappings exist for this alias+customer, the save
+            // succeeds but the admin is shown an informational notice afterwards.
+            $pre_existing = CIA_DB::find_alias_mappings(
+                $data['user_id'],
+                $data['alias_code'],
+                $id
+            );
+            $is_multi = count( $pre_existing ) > 0;
+
             $id ? CIA_DB::update( $id, $data ) : CIA_DB::insert( $data );
-            self::redirect( 'saved' );
+            self::redirect( $is_multi ? 'saved_multi' : 'saved' );
         }
     }
 
     // -------------------------------------------------------------------------
-    // CSV Export — streams directly to browser, then exits
+    // CSV Export — streams directly to browser then exits
     // -------------------------------------------------------------------------
 
-    /**
-     * Stream all alias rows (or filtered by customer) as a UTF-8 CSV download.
-     * Includes UTF-8 BOM so Excel opens the file without encoding issues.
-     *
-     * @param int $customer_id  0 = all customers.
-     */
     private static function stream_export_csv( int $customer_id = 0 ): void {
         $rows     = CIA_DB::get_rows_for_export( $customer_id ?: null );
         $filename = $customer_id
             ? sprintf( 'aliases-customer-%d-%s.csv', $customer_id, gmdate( 'Y-m-d' ) )
             : sprintf( 'aliases-all-%s.csv', gmdate( 'Y-m-d' ) );
 
-        // Clear any output buffers started by WordPress before sending headers.
-        while ( ob_get_level() > 0 ) {
-            ob_end_clean();
-        }
+        while ( ob_get_level() > 0 ) ob_end_clean();
 
         header( 'Content-Type: text/csv; charset=utf-8' );
         header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
@@ -172,12 +241,8 @@ class CIA_Admin {
         header( 'Expires: 0' );
 
         $out = fopen( 'php://output', 'w' );
-        fwrite( $out, "\xEF\xBB\xBF" ); // UTF-8 BOM
-
-        fputcsv( $out, [
-            'user_id', 'customer_name', 'customer_email',
-            'alias_code', 'ean8_code', 'is_active', 'expires_at', 'created_at',
-        ] );
+        fwrite( $out, "\xEF\xBB\xBF" );
+        fputcsv( $out, [ 'user_id', 'customer_name', 'customer_email', 'alias_code', 'ean8_code', 'is_active', 'expires_at', 'created_at' ] );
 
         foreach ( $rows as $row ) {
             $user = get_userdata( (int) $row['user_id'] );
@@ -198,27 +263,11 @@ class CIA_Admin {
     }
 
     // -------------------------------------------------------------------------
-    // CSV Template — streams a sample file admins can fill in and re-import
+    // CSV Template download
     // -------------------------------------------------------------------------
 
-    /**
-     * Stream a sample import template CSV.
-     *
-     * Accepted import columns:
-     *   user_id         — WordPress user ID  (use this OR customer_email)
-     *   customer_email  — customer e-mail    (used to look up user_id)
-     *   alias_code      — REQUIRED
-     *   ean8_code       — REQUIRED, exactly 8 digits
-     *   is_active       — optional; 1 = active (default), 0 = disabled
-     *   expires_at      — optional; MySQL datetime or any parseable date; blank = never
-     *
-     * Note: customer_name and created_at columns present in exports are
-     * silently ignored on import — they exist only for human readability.
-     */
     private static function stream_template_csv(): void {
-        while ( ob_get_level() > 0 ) {
-            ob_end_clean();
-        }
+        while ( ob_get_level() > 0 ) ob_end_clean();
 
         header( 'Content-Type: text/csv; charset=utf-8' );
         header( 'Content-Disposition: attachment; filename="aliases-import-template.csv"' );
@@ -227,13 +276,10 @@ class CIA_Admin {
 
         $out = fopen( 'php://output', 'w' );
         fwrite( $out, "\xEF\xBB\xBF" );
-
         fputcsv( $out, [ 'user_id', 'customer_email', 'alias_code', 'ean8_code', 'is_active', 'expires_at' ] );
-        // Example rows (placeholder data — replace before importing)
         fputcsv( $out, [ '3', 'customer@example.com', 'CUST-CODE-001', '30000070', '1', '' ] );
         fputcsv( $out, [ '3', 'customer@example.com', 'CUST-CODE-002', '30000087', '1', '2026-12-31 00:00:00' ] );
         fputcsv( $out, [ '5', 'another@example.com',  'MY-REF-XYZ',   '30000094', '0', '' ] );
-
         fclose( $out );
         exit;
     }
@@ -242,17 +288,6 @@ class CIA_Admin {
     // CSV Import processor
     // -------------------------------------------------------------------------
 
-    /**
-     * Parse and import an uploaded CSV file.
-     *
-     * Rules:
-     *  - Header row must contain alias_code, ean8_code, AND one of user_id / customer_email.
-     *  - Rows with a customer that cannot be resolved are logged as errors and skipped.
-     *  - Rows where (user_id, alias_code, ean8_code) already exists are counted as
-     *    skipped (duplicate) — NOT treated as errors.
-     *  - All other validation failures (bad EAN8, empty alias) are counted as errors.
-     *  - Results are stored in a short-lived transient and shown after redirect.
-     */
     private static function process_import(): void {
         $upload = $_FILES['import_csv'] ?? null;
 
@@ -272,7 +307,6 @@ class CIA_Admin {
             return;
         }
 
-        // Read and normalise header row
         $raw_headers = fgetcsv( $handle );
         if ( ! $raw_headers ) {
             fclose( $handle );
@@ -280,7 +314,6 @@ class CIA_Admin {
             return;
         }
 
-        // Strip UTF-8 BOM from first cell if Excel added it
         $raw_headers[0] = ltrim( $raw_headers[0], "\xEF\xBB\xBF" );
         $headers = array_map( 'strtolower', array_map( 'trim', $raw_headers ) );
         $col     = array_flip( $headers );
@@ -293,7 +326,6 @@ class CIA_Admin {
             self::redirect( 'import_missing_user_col' );
             return;
         }
-
         if ( ! isset( $col['alias_code'] ) || ! isset( $col['ean8_code'] ) ) {
             fclose( $handle );
             self::redirect( 'import_missing_cols' );
@@ -305,63 +337,41 @@ class CIA_Admin {
 
         while ( ( $raw = fgetcsv( $handle ) ) !== false ) {
             $row_num++;
+            if ( array_filter( $raw ) === [] ) continue;
 
-            // Skip blank lines
-            if ( array_filter( $raw ) === [] ) {
-                continue;
-            }
-
-            // ── Resolve customer ────────────────────────────────────────────
             $user_id = 0;
-
             if ( $has_uid && ! empty( $raw[ $col['user_id'] ] ) ) {
                 $user_id = absint( trim( $raw[ $col['user_id'] ] ) );
             }
-
-            // Fall back to e-mail lookup if user_id missing or zero
             if ( ! $user_id && $has_email && ! empty( $raw[ $col['customer_email'] ] ) ) {
                 $u       = get_user_by( 'email', sanitize_email( trim( $raw[ $col['customer_email'] ] ) ) );
                 $user_id = $u ? $u->ID : 0;
             }
-
             if ( ! $user_id ) {
-                $stats['errors'][] = sprintf(
-                    /* translators: %d = CSV row number */
-                    __( 'Row %d: customer not found.', 'customer-item-aliases' ),
-                    $row_num
-                );
+                $stats['errors'][] = sprintf( __( 'Row %d: customer not found.', 'customer-item-aliases' ), $row_num );
                 continue;
             }
 
-            // ── Validate required fields ────────────────────────────────────
             $alias_code = sanitize_text_field( trim( $raw[ $col['alias_code'] ] ?? '' ) );
             $ean8_code  = sanitize_text_field( trim( $raw[ $col['ean8_code']  ] ?? '' ) );
 
             if ( $alias_code === '' ) {
-                $stats['errors'][] = sprintf(
-                    __( 'Row %d: alias_code is empty.', 'customer-item-aliases' ),
-                    $row_num
-                );
+                $stats['errors'][] = sprintf( __( 'Row %d: alias_code is empty.', 'customer-item-aliases' ), $row_num );
                 continue;
             }
-
             if ( ! preg_match( '/^\d{8}$/', $ean8_code ) ) {
                 $stats['errors'][] = sprintf(
-                    /* translators: %1$d = row, %2$s = value provided */
                     __( 'Row %1$d: ean8_code "%2$s" must be exactly 8 digits.', 'customer-item-aliases' ),
-                    $row_num,
-                    $ean8_code
+                    $row_num, $ean8_code
                 );
                 continue;
             }
 
-            // ── Skip duplicates ─────────────────────────────────────────────
             if ( CIA_DB::row_exists( $user_id, $alias_code, $ean8_code ) ) {
                 $stats['skipped']++;
                 continue;
             }
 
-            // ── Optional fields ─────────────────────────────────────────────
             $is_active = 1;
             if ( isset( $col['is_active'] ) && isset( $raw[ $col['is_active'] ] ) ) {
                 $raw_active = strtolower( trim( $raw[ $col['is_active'] ] ) );
@@ -371,12 +381,9 @@ class CIA_Admin {
             $expires_at = null;
             if ( isset( $col['expires_at'] ) && ! empty( $raw[ $col['expires_at'] ] ) ) {
                 $ts = strtotime( trim( $raw[ $col['expires_at'] ] ) );
-                if ( $ts ) {
-                    $expires_at = date( 'Y-m-d H:i:s', $ts );
-                }
+                if ( $ts ) $expires_at = date( 'Y-m-d H:i:s', $ts );
             }
 
-            // ── Insert ──────────────────────────────────────────────────────
             $ok = CIA_DB::insert( [
                 'user_id'    => $user_id,
                 'alias_code' => $alias_code,
@@ -388,16 +395,11 @@ class CIA_Admin {
             if ( $ok ) {
                 $stats['imported']++;
             } else {
-                $stats['errors'][] = sprintf(
-                    __( 'Row %d: database insert failed.', 'customer-item-aliases' ),
-                    $row_num
-                );
+                $stats['errors'][] = sprintf( __( 'Row %d: database insert failed.', 'customer-item-aliases' ), $row_num );
             }
         }
 
         fclose( $handle );
-
-        // Store results for display after redirect (60-second TTL is plenty)
         set_transient( 'cia_import_result_' . get_current_user_id(), $stats, 60 );
         self::redirect( 'imported' );
     }
@@ -426,9 +428,7 @@ class CIA_Admin {
                 <?php esc_html_e( 'Add New', 'customer-item-aliases' ); ?>
             </a>
             <hr class="wp-header-end">
-
             <?php self::render_import_export_panels(); ?>
-
             <form method="get">
                 <input type="hidden" name="page" value="cia-aliases" />
                 <?php
@@ -441,7 +441,7 @@ class CIA_Admin {
     }
 
     // -------------------------------------------------------------------------
-    // Import / Export UI panels
+    // Import / Export panels
     // -------------------------------------------------------------------------
 
     private static function render_import_export_panels(): void {
@@ -452,64 +452,46 @@ class CIA_Admin {
             'action'   => 'download_template',
             '_wpnonce' => $export_nonce,
         ], $base_url );
-        $customers    = CIA_DB::get_customers_with_aliases();
+        $customers = CIA_DB::get_customers_with_aliases();
         ?>
         <div style="display:flex;gap:20px;margin:16px 0 20px;flex-wrap:wrap;">
 
-            <!-- ─── Import ─────────────────────────────────────────────────── -->
             <div class="postbox" style="flex:1;min-width:280px;margin-bottom:0;">
                 <h2 class="hndle" style="padding:8px 12px;font-size:14px;">
                     <span>&#8595;&nbsp;<?php esc_html_e( 'Import Aliases', 'customer-item-aliases' ); ?></span>
                 </h2>
                 <div class="inside" style="padding:12px 16px;">
                     <p class="description" style="margin-bottom:10px;">
-                        <?php esc_html_e( 'Upload a CSV file to bulk-import aliases. Duplicate rows (same customer + alias + EAN8) are skipped automatically.', 'customer-item-aliases' ); ?>
-                        &nbsp;<a href="<?php echo esc_url( $template_url ); ?>">
-                            <?php esc_html_e( 'Download template', 'customer-item-aliases' ); ?>
-                        </a>
+                        <?php esc_html_e( 'Upload a CSV to bulk-import aliases. Duplicate rows are skipped automatically.', 'customer-item-aliases' ); ?>
+                        &nbsp;<a href="<?php echo esc_url( $template_url ); ?>"><?php esc_html_e( 'Download template', 'customer-item-aliases' ); ?></a>
                     </p>
-                    <form method="post"
-                          enctype="multipart/form-data"
-                          action="<?php echo esc_url( $base_url ); ?>">
+                    <form method="post" enctype="multipart/form-data" action="<?php echo esc_url( $base_url ); ?>">
                         <?php wp_nonce_field( 'cia_import' ); ?>
                         <input type="hidden" name="page"   value="cia-aliases" />
                         <input type="hidden" name="action" value="import" />
-
-                        <input type="file"
-                               name="import_csv"
-                               accept=".csv,text/csv"
-                               required
+                        <input type="file" name="import_csv" accept=".csv,text/csv" required
                                style="display:block;margin-bottom:10px;max-width:100%;" />
-
-                        <?php submit_button(
-                            __( 'Import CSV', 'customer-item-aliases' ),
-                            'secondary',
-                            'submit_import',
-                            false
-                        ); ?>
+                        <?php submit_button( __( 'Import CSV', 'customer-item-aliases' ), 'secondary', 'submit_import', false ); ?>
                     </form>
                 </div>
             </div>
 
-            <!-- ─── Export ─────────────────────────────────────────────────── -->
             <div class="postbox" style="flex:1;min-width:280px;margin-bottom:0;">
                 <h2 class="hndle" style="padding:8px 12px;font-size:14px;">
                     <span>&#8593;&nbsp;<?php esc_html_e( 'Export Aliases', 'customer-item-aliases' ); ?></span>
                 </h2>
                 <div class="inside" style="padding:12px 16px;">
                     <p class="description" style="margin-bottom:10px;">
-                        <?php esc_html_e( 'Download all aliases (or a single customer\'s) as a CSV file. Exported files include all columns and can be re-imported.', 'customer-item-aliases' ); ?>
+                        <?php esc_html_e( 'Download all aliases or a single customer\'s as CSV. Exported files can be re-imported.', 'customer-item-aliases' ); ?>
                     </p>
                     <form method="get" action="<?php echo esc_url( $base_url ); ?>">
                         <input type="hidden" name="page"     value="cia-aliases" />
                         <input type="hidden" name="action"   value="export" />
                         <input type="hidden" name="_wpnonce" value="<?php echo esc_attr( $export_nonce ); ?>" />
-
                         <label for="cia-export-customer" style="display:block;margin-bottom:4px;font-weight:600;">
                             <?php esc_html_e( 'Customer', 'customer-item-aliases' ); ?>
                         </label>
-                        <select name="customer_id"
-                                id="cia-export-customer"
+                        <select name="customer_id" id="cia-export-customer"
                                 style="min-width:220px;max-width:100%;margin-bottom:10px;">
                             <option value="0"><?php esc_html_e( '— All Customers —', 'customer-item-aliases' ); ?></option>
                             <?php foreach ( $customers as $uid ) : ?>
@@ -519,13 +501,7 @@ class CIA_Admin {
                                 </option>
                             <?php endforeach; ?>
                         </select><br />
-
-                        <?php submit_button(
-                            __( 'Export CSV', 'customer-item-aliases' ),
-                            'secondary',
-                            'submit_export',
-                            false
-                        ); ?>
+                        <?php submit_button( __( 'Export CSV', 'customer-item-aliases' ), 'secondary', 'submit_export', false ); ?>
                     </form>
                 </div>
             </div>
@@ -543,10 +519,9 @@ class CIA_Admin {
         $item     = ( $action === 'edit' && $id ) ? CIA_DB::get_row( $id ) : null;
         $list_url = add_query_arg( [ 'page' => 'cia-aliases' ], admin_url( 'admin.php' ) );
 
-        $expires_at_input  = '';
-        if ( ! empty( $item['expires_at'] ) ) {
-            $expires_at_input = date( 'Y-m-d\TH:i', strtotime( $item['expires_at'] ) );
-        }
+        $expires_at_input  = ! empty( $item['expires_at'] )
+            ? date( 'Y-m-d\TH:i', strtotime( $item['expires_at'] ) )
+            : '';
         $is_active_checked = isset( $item['is_active'] ) ? (bool) $item['is_active'] : true;
 
         wp_enqueue_style( 'select2' );
@@ -563,13 +538,23 @@ class CIA_Admin {
             }
         }
 
-        wp_localize_script( 'select2', 'ciaCustomerSelect', [
-            'ajaxUrl'     => admin_url( 'admin-ajax.php' ),
-            'nonce'       => wp_create_nonce( 'cia_search_customers' ),
-            'placeholder' => __( '\u2014 Search by name or email \u2014', 'customer-item-aliases' ),
-            'preselected' => $preselected,
-        ] );
+        // Inject both Select2 data and alias-check nonce before the script
+        wp_add_inline_script( 'select2',
+            'var ciaCustomerSelect = ' . wp_json_encode( [
+                'ajaxUrl'     => admin_url( 'admin-ajax.php' ),
+                'nonce'       => wp_create_nonce( 'cia_search_customers' ),
+                'placeholder' => __( '\u2014 Search by name or email \u2014', 'customer-item-aliases' ),
+                'preselected' => $preselected,
+            ] ) . ';' .
+            'var ciaAliasCheck = '   . wp_json_encode( [
+                'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+                'nonce'   => wp_create_nonce( 'cia_check_alias' ),
+            ] ) . ';',
+            'before'
+        );
+
         wp_add_inline_script( 'select2', self::get_select2_init_script() );
+        wp_add_inline_script( 'select2', self::get_duplicate_check_script() );
         ?>
 
         <div class="wrap">
@@ -625,6 +610,12 @@ class CIA_Admin {
                                    maxlength="8" pattern="\d{8}" required />
                             <p class="description"><?php esc_html_e( 'Must be exactly 8 digits.', 'customer-item-aliases' ); ?></p>
                         </td>
+                    </tr>
+
+                    <!-- Duplicate / conflict notice row — injected by JS, hidden by default -->
+                    <tr id="cia-conflict-row" style="display:none;">
+                        <th></th>
+                        <td><div id="cia-conflict-notice"></div></td>
                     </tr>
 
                     <tr>
@@ -686,10 +677,7 @@ class CIA_Admin {
                         };
                     },
                     processResults: function(data) {
-                        return {
-                            results    : data.results,
-                            pagination : data.pagination
-                        };
+                        return { results: data.results, pagination: data.pagination };
                     }
                 },
                 placeholder:        cfg.placeholder || '\u2014 Search by name or email \u2014',
@@ -707,6 +695,104 @@ class CIA_Admin {
     }
 
     // -------------------------------------------------------------------------
+    // Real-time duplicate / conflict check script
+    // -------------------------------------------------------------------------
+
+    /**
+     * Watches the Customer, Alias Code, and EAN8 fields.
+     * After a 500ms debounce it fires an AJAX call to cia_check_alias and
+     * renders an inline notice in the form:
+     *
+     *   ❌ Red   — exact duplicate (save will be blocked server-side)
+     *   ⚠️ Amber — alias already maps to other EAN(s); save creates a multi-EAN alias
+     *   (none) — no conflicts found
+     */
+    private static function get_duplicate_check_script(): string {
+        return <<<'JS'
+        jQuery(function ($) {
+            var data  = window.ciaAliasCheck || {};
+            var timer = null;
+
+            var $row    = $('#cia-conflict-row');
+            var $notice = $('#cia-conflict-notice');
+
+            function showNotice(type, html) {
+                var bg    = { error: '#fcf0f1', warning: '#fcf9e8', info: '#eaf4fb' };
+                var color = { error: '#b32d2e', warning: '#996800', info: '#014671' };
+                var icon  = { error: '\u274C', warning: '\u26A0\uFE0F', info: '\u2139\uFE0F' };
+                $row.show();
+                $notice.html(
+                    '<p style="margin:0;padding:8px 10px;border-radius:3px;' +
+                    'background:' + (bg[type]    || '#fff') + ';' +
+                    'color:'      + (color[type] || '#333') + ';' +
+                    'border-left:4px solid ' + (color[type] || '#ccc') + ';">' +
+                    (icon[type] ? icon[type] + ' ' : '') + html + '</p>'
+                );
+            }
+
+            function clearNotice() {
+                $row.hide();
+                $notice.html('');
+            }
+
+            function runCheck() {
+                var userId    = $('#cia-customer-select').val();
+                var aliasCode = $.trim($('#alias_code').val());
+                var ean8Code  = $.trim($('#ean8_code').val());
+                var excludeId = $('input[name="id"]').val() || 0;
+
+                if (!userId || !aliasCode) { clearNotice(); return; }
+
+                $.post(data.ajaxUrl, {
+                    action    : 'cia_check_alias',
+                    nonce     : data.nonce,
+                    user_id   : userId,
+                    alias_code: aliasCode,
+                    ean8_code : ean8Code,
+                    id        : excludeId
+                }, function (res) {
+                    if (!res) return;
+
+                    if (res.exact_duplicate) {
+                        showNotice('error',
+                            '<strong>Duplicate:</strong> This exact alias mapping already exists for this customer. ' +
+                            'Saving will be blocked.'
+                        );
+                        return;
+                    }
+
+                    if (res.existing_mappings && res.existing_mappings.length) {
+                        var eans = res.existing_mappings
+                            .map(function(m) { return '<code>' + $('<span>').text(m.ean8_code).html() + '</code>'; })
+                            .join(', ');
+                        showNotice('warning',
+                            '<strong>Note:</strong> This alias already maps to EAN ' + eans +
+                            ' for this customer. Saving will create a second mapping (multi-EAN alias — both products will appear in search results).'
+                        );
+                        return;
+                    }
+
+                    clearNotice();
+                });
+            }
+
+            function triggerCheck() {
+                clearTimeout(timer);
+                timer = setTimeout(runCheck, 500);
+            }
+
+            $('#alias_code, #ean8_code').on('input', triggerCheck);
+            $('#cia-customer-select').on('change', triggerCheck);
+
+            // Run immediately on page load when editing an existing row
+            if ($('input[name="id"]').val() > 0) {
+                runCheck();
+            }
+        });
+        JS;
+    }
+
+    // -------------------------------------------------------------------------
     // Admin notices
     // -------------------------------------------------------------------------
 
@@ -714,34 +800,36 @@ class CIA_Admin {
         $msg_key = sanitize_key( $_GET['cia_msg'] ?? '' );
         if ( ! $msg_key ) return;
 
-        // Dynamic import result — retrieved from a short-lived transient
+        // Dynamic import result (transient)
         if ( $msg_key === 'imported' ) {
             $uid   = get_current_user_id();
             $stats = get_transient( 'cia_import_result_' . $uid );
             delete_transient( 'cia_import_result_' . $uid );
-            if ( $stats ) {
-                self::render_import_notice( $stats );
-            }
+            if ( $stats ) self::render_import_notice( $stats );
             return;
         }
 
-        // Static notices
         $messages = [
-            'saved'                   => [ 'success', __( 'Alias saved successfully.',                              'customer-item-aliases' ) ],
-            'deleted'                 => [ 'success', __( 'Alias deleted.',                                         'customer-item-aliases' ) ],
-            'enabled'                 => [ 'success', __( 'Alias enabled.',                                         'customer-item-aliases' ) ],
-            'disabled'                => [ 'success', __( 'Alias disabled.',                                        'customer-item-aliases' ) ],
-            'bulk_deleted'            => [ 'success', __( 'Selected aliases deleted.',                              'customer-item-aliases' ) ],
-            'bulk_enabled'            => [ 'success', __( 'Selected aliases enabled.',                              'customer-item-aliases' ) ],
-            'bulk_disabled'           => [ 'success', __( 'Selected aliases disabled.',                             'customer-item-aliases' ) ],
-            'invalid_ean8'            => [ 'error',   __( 'EAN8 must be exactly 8 digits.',                         'customer-item-aliases' ) ],
-            'no_user'                 => [ 'error',   __( 'Please select a customer.',                              'customer-item-aliases' ) ],
-            'no_file'                 => [ 'error',   __( 'No file selected or upload failed.',                     'customer-item-aliases' ) ],
-            'invalid_file_type'       => [ 'error',   __( 'Please upload a .csv file.',                             'customer-item-aliases' ) ],
-            'import_read_error'       => [ 'error',   __( 'Could not read the uploaded file.',                      'customer-item-aliases' ) ],
-            'import_empty'            => [ 'error',   __( 'The CSV file is empty.',                                 'customer-item-aliases' ) ],
-            'import_missing_user_col' => [ 'error',   __( 'CSV must include a user_id or customer_email column.',   'customer-item-aliases' ) ],
-            'import_missing_cols'     => [ 'error',   __( 'CSV must include alias_code and ean8_code columns.',     'customer-item-aliases' ) ],
+            // Success
+            'saved'                   => [ 'success', __( 'Alias saved successfully.',                                                       'customer-item-aliases' ) ],
+            'saved_multi'             => [ 'info',    __( 'Alias saved. This alias now maps to multiple EAN codes for this customer.',       'customer-item-aliases' ) ],
+            'deleted'                 => [ 'success', __( 'Alias deleted.',                                                                  'customer-item-aliases' ) ],
+            'enabled'                 => [ 'success', __( 'Alias enabled.',                                                                  'customer-item-aliases' ) ],
+            'disabled'                => [ 'success', __( 'Alias disabled.',                                                                 'customer-item-aliases' ) ],
+            'bulk_deleted'            => [ 'success', __( 'Selected aliases deleted.',                                                       'customer-item-aliases' ) ],
+            'bulk_enabled'            => [ 'success', __( 'Selected aliases enabled.',                                                       'customer-item-aliases' ) ],
+            'bulk_disabled'           => [ 'success', __( 'Selected aliases disabled.',                                                      'customer-item-aliases' ) ],
+            // Errors — form validation
+            'no_user'                 => [ 'error',   __( 'Please select a customer.',                                                       'customer-item-aliases' ) ],
+            'invalid_ean8'            => [ 'error',   __( 'EAN8 must be exactly 8 digits.',                                                  'customer-item-aliases' ) ],
+            'duplicate_alias'         => [ 'error',   __( 'This exact alias mapping already exists for this customer. No changes were saved.', 'customer-item-aliases' ) ],
+            // Errors — import
+            'no_file'                 => [ 'error',   __( 'No file selected or upload failed.',                                              'customer-item-aliases' ) ],
+            'invalid_file_type'       => [ 'error',   __( 'Please upload a .csv file.',                                                      'customer-item-aliases' ) ],
+            'import_read_error'       => [ 'error',   __( 'Could not read the uploaded file.',                                               'customer-item-aliases' ) ],
+            'import_empty'            => [ 'error',   __( 'The CSV file is empty.',                                                          'customer-item-aliases' ) ],
+            'import_missing_user_col' => [ 'error',   __( 'CSV must include a user_id or customer_email column.',                            'customer-item-aliases' ) ],
+            'import_missing_cols'     => [ 'error',   __( 'CSV must include alias_code and ean8_code columns.',                              'customer-item-aliases' ) ],
         ];
 
         if ( isset( $messages[ $msg_key ] ) ) {
@@ -754,9 +842,6 @@ class CIA_Admin {
         }
     }
 
-    /**
-     * Render a detailed import result notice (called after a successful import redirect).
-     */
     private static function render_import_notice( array $stats ): void {
         $parts = [];
         if ( $stats['imported'] > 0 ) {
@@ -783,14 +868,11 @@ class CIA_Admin {
         if ( ! empty( $stats['errors'] ) ) {
             $shown  = array_slice( $stats['errors'], 0, 10 );
             $hidden = count( $stats['errors'] ) - count( $shown );
-
             echo '<ul style="margin-top:4px;margin-bottom:4px;">';
-            foreach ( $shown as $err ) {
-                echo '<li>' . esc_html( $err ) . '</li>';
-            }
+            foreach ( $shown as $err ) echo '<li>' . esc_html( $err ) . '</li>';
             if ( $hidden > 0 ) {
                 echo '<li>' . sprintf(
-                    esc_html( _n( '&hellip;and %d more error.', '&hellip;and %d more errors.', $hidden, 'customer-item-aliases' ) ),
+                    esc_html( _n( '\u2026and %d more error.', '\u2026and %d more errors.', $hidden, 'customer-item-aliases' ) ),
                     $hidden
                 ) . '</li>';
             }

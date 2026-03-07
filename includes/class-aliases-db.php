@@ -24,13 +24,7 @@ class CIA_DB {
 
     /**
      * Create (or upgrade) the alias table via dbDelta.
-     *
-     * dbDelta safely adds new columns to an existing table without removing or
-     * modifying existing ones, making it safe to call on every plugin upgrade.
-     *
-     * Columns:
-     *   is_active  (TINYINT 0/1, default 1) — soft-delete flag.
-     *   expires_at (DATETIME, nullable)      — optional expiry timestamp.
+     * dbDelta safely adds new columns without removing or modifying existing ones.
      */
     public static function create_table(): void {
         global $wpdb;
@@ -57,10 +51,7 @@ class CIA_DB {
         update_option( 'cia_db_version', CIA_VERSION );
     }
 
-    /**
-     * Run DB migrations when the stored schema version is behind CIA_VERSION.
-     * Zero overhead on normal page loads once already at current version.
-     */
+    /** Run DB migrations when stored version is behind CIA_VERSION. */
     public static function maybe_upgrade(): void {
         if ( get_option( 'cia_db_version' ) === CIA_VERSION ) {
             return;
@@ -72,9 +63,7 @@ class CIA_DB {
     // Admin list helpers
     // -------------------------------------------------------------------------
 
-    /**
-     * Fetch rows for the admin list table (ALL rows, regardless of status).
-     */
+    /** Fetch rows for the admin list table (ALL rows, regardless of status). */
     public static function get_rows( array $args = [] ): array {
         global $wpdb;
         $table   = self::table();
@@ -134,15 +123,95 @@ class CIA_DB {
     }
 
     // -------------------------------------------------------------------------
+    // Duplicate / conflict detection
+    // -------------------------------------------------------------------------
+
+    /**
+     * Find an exact (user_id, alias_code, ean8_code) duplicate.
+     *
+     * Used in two places:
+     *  1. AJAX real-time check while the admin fills in the form.
+     *  2. Server-side guard in handle_actions() before insert/update.
+     *
+     * @param  int    $user_id
+     * @param  string $alias_code
+     * @param  string $ean8_code
+     * @param  int    $exclude_id  Row ID to exclude — pass the current row's ID
+     *                             when editing so a row isn't flagged as its own
+     *                             duplicate. Pass 0 when adding a new row.
+     * @return array|null          The conflicting row, or null if no duplicate.
+     */
+    public static function find_exact_duplicate(
+        int $user_id,
+        string $alias_code,
+        string $ean8_code,
+        int $exclude_id = 0
+    ): ?array {
+        global $wpdb;
+        $table = self::table();
+
+        return $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT id, alias_code, ean8_code
+                 FROM {$table}
+                 WHERE user_id    = %d
+                   AND alias_code = %s
+                   AND ean8_code  = %s
+                   AND id        != %d
+                 LIMIT 1",
+                $user_id,
+                $alias_code,
+                $ean8_code,
+                $exclude_id
+            ),
+            ARRAY_A
+        ) ?: null;
+    }
+
+    /**
+     * Find all OTHER EAN mappings for a given (user_id, alias_code) pair.
+     *
+     * A non-empty result means the alias already resolves to at least one other
+     * EAN code for this customer. This is intentional and valid (multi-EAN
+     * alias), but the admin should be informed they are creating a second
+     * mapping rather than replacing an existing one.
+     *
+     * @param  int    $user_id
+     * @param  string $alias_code
+     * @param  int    $exclude_id  Exclude the row being edited (0 when adding).
+     * @return array[]             Rows with id, ean8_code, is_active, expires_at.
+     */
+    public static function find_alias_mappings(
+        int $user_id,
+        string $alias_code,
+        int $exclude_id = 0
+    ): array {
+        global $wpdb;
+        $table = self::table();
+
+        return $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT id, ean8_code, is_active, expires_at
+                 FROM {$table}
+                 WHERE user_id    = %d
+                   AND alias_code = %s
+                   AND id        != %d
+                 ORDER BY id ASC",
+                $user_id,
+                $alias_code,
+                $exclude_id
+            ),
+            ARRAY_A
+        ) ?: [];
+    }
+
+    // -------------------------------------------------------------------------
     // Export helpers
     // -------------------------------------------------------------------------
 
     /**
      * Fetch all rows for CSV export, optionally scoped to one customer.
      * Returns ALL rows (active, disabled, expired) for full admin visibility.
-     *
-     * @param  int|null $user_id  Customer user ID, or null for all customers.
-     * @return array[]
      */
     public static function get_rows_for_export( ?int $user_id = null ): array {
         global $wpdb;
@@ -204,11 +273,7 @@ class CIA_DB {
         return self::resolve_aliases( $user_id, $alias )[0] ?? null;
     }
 
-    /**
-     * Exact match: all active, non-expired EAN codes for a specific customer.
-     *
-     * @return string[]
-     */
+    /** Exact match: all active, non-expired EAN codes for a specific customer. */
     public static function resolve_aliases( int $user_id, string $alias ): array {
         global $wpdb;
         $table = self::table();
@@ -228,12 +293,7 @@ class CIA_DB {
         ) ?: [];
     }
 
-    /**
-     * Exact match: all active, non-expired EAN codes across ALL customers.
-     * Used for admin searches.
-     *
-     * @return string[]
-     */
+    /** Exact match: all active, non-expired EAN codes across ALL customers (admin). */
     public static function resolve_aliases_global( string $alias ): array {
         global $wpdb;
         $table = self::table();
@@ -255,11 +315,7 @@ class CIA_DB {
     // LIKE (partial) fallback resolvers
     // -------------------------------------------------------------------------
 
-    /**
-     * Partial match: active, non-expired aliases containing the term, scoped to one customer.
-     *
-     * @return string[]
-     */
+    /** Partial match: active, non-expired aliases containing the term, scoped to one customer. */
     public static function resolve_aliases_like( int $user_id, string $alias ): array {
         global $wpdb;
         $table   = self::table();
@@ -280,11 +336,7 @@ class CIA_DB {
         ) ?: [];
     }
 
-    /**
-     * Partial match: active, non-expired aliases containing the term, across ALL customers.
-     *
-     * @return string[]
-     */
+    /** Partial match: active, non-expired aliases containing the term, across ALL customers. */
     public static function resolve_aliases_global_like( string $alias ): array {
         global $wpdb;
         $table   = self::table();
@@ -310,13 +362,7 @@ class CIA_DB {
     /**
      * Insert a new alias record.
      *
-     * @param array $data {
-     *   int         $user_id
-     *   string      $alias_code
-     *   string      $ean8_code
-     *   int         $is_active   Optional. Defaults to 1.
-     *   string|null $expires_at  Optional. MySQL datetime or null.
-     * }
+     * @param array $data { user_id, alias_code, ean8_code, is_active?, expires_at? }
      */
     public static function insert( array $data ): bool {
         global $wpdb;
@@ -338,7 +384,7 @@ class CIA_DB {
 
     /**
      * Update an existing alias record.
-     * Passing expires_at = null explicitly clears the expiry date.
+     * Passing expires_at = null clears the expiry date.
      */
     public static function update( int $id, array $data ): bool {
         global $wpdb;
@@ -360,11 +406,7 @@ class CIA_DB {
         );
     }
 
-    /**
-     * Enable or disable a single alias record.
-     *
-     * @param bool $active  true = enable, false = disable.
-     */
+    /** Enable or disable a single alias record. */
     public static function set_active( int $id, bool $active ): bool {
         global $wpdb;
         return (bool) $wpdb->update(
