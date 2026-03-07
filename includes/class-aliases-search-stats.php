@@ -37,7 +37,8 @@ class CIA_Search_Stats {
             searched_at  DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             INDEX idx_user_searched (user_id, searched_at),
-            INDEX idx_term_searched (search_term, searched_at)
+            INDEX idx_term_searched (search_term, searched_at),
+            FULLTEXT INDEX ft_search_term (search_term)
         ) {$charset_collate};";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';

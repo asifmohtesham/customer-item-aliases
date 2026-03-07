@@ -259,6 +259,8 @@ class CIA_Hooks {
      * Admin: global alias lookup (any customer's alias resolves).
      * Customer: scoped to their own aliases only.
      * Both stages (exact then LIKE) apply via resolve().
+     *
+     * Returns WP_Error with code 'cia_product_not_found' if no product exists.
      */
     public static function resolve_in_scanner(
         $result,
@@ -294,7 +296,17 @@ class CIA_Hooks {
             )
         );
 
-        if ( ! $post_id ) return $result;
+        if ( ! $post_id ) {
+            return new WP_Error(
+                'cia_product_not_found',
+                sprintf(
+                    /* translators: %s: scanned code */
+                    __( 'No product found for code: %s', 'customer-item-aliases' ),
+                    $raw_data
+                ),
+                [ 'status' => 404, 'scanned_code' => $raw_data ]
+            );
+        }
 
         $controller = new CUSTOM_WC_REST_Products_Controller();
         $req        = new WP_REST_Request( 'GET' );
