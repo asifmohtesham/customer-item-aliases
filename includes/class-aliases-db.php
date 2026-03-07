@@ -32,8 +32,12 @@ class CIA_DB {
             created_at  DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             INDEX idx_user_alias (user_id, alias_code),
-            INDEX idx_ean8       (ean8_code),
-            INDEX idx_active     (is_active)
+            INDEX idx_user_ean (user_id, ean8_code),
+            INDEX idx_ean8 (ean8_code),
+            INDEX idx_alias_active (alias_code, is_active),
+            INDEX idx_expires (expires_at, is_active),
+            INDEX idx_active (is_active),
+            FULLTEXT INDEX ft_alias_code (alias_code)
         ) {$charset_collate};";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
@@ -261,6 +265,29 @@ class CIA_DB {
         );
     }
 
+    /**
+     * Check if an EAN code exists in the product catalog.
+     * 
+     * @param string $ean8_code The EAN to validate.
+     * @return bool True if product with this EAN exists.
+     */
+    public static function ean_exists_in_catalog( string $ean8_code ): bool {
+        global $wpdb;
+        $ean_meta_key = (string) apply_filters( 'cia_ean_meta_key', CIA_EAN_META_KEY );
+        
+        return (bool) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT post_id
+                 FROM {$wpdb->postmeta}
+                 WHERE meta_key   = %s
+                   AND meta_value = %s
+                 LIMIT 1",
+                $ean_meta_key,
+                $ean8_code
+            )
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Exact-match resolvers (active + non-expired only)
     // -------------------------------------------------------------------------
@@ -400,7 +427,7 @@ class CIA_DB {
         ];
 
         // wpdb::update returns int (rows affected) or false on error.
-        // !== false covers the case where values haven’t changed (0 rows affected)
+        // !== false covers the case where values haven't changed (0 rows affected)
         // which is a valid successful no-op update, not an error.
         $result = $wpdb->update(
             self::table(),
