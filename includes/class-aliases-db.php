@@ -50,26 +50,80 @@ class CIA_DB {
     }
 
     // -------------------------------------------------------------------------
+    // WHERE condition builder (shared by get_rows, count_rows_filtered)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Build an array of prepared WHERE conditions from a filter args array.
+     *
+     * Supported keys:
+     *   string $search       LIKE match on alias_code and ean8_code.
+     *   int    $customer_id  Exact match on user_id.
+     *   string $status       'active' | 'disabled' | 'expired' | 'all' (default).
+     *
+     * @return string[]  Ready-to-implode SQL fragments (already escaped).
+     */
+    private static function build_conditions( array $args ): array {
+        global $wpdb;
+        $conditions  = [];
+        $search      = $args['search']      ?? '';
+        $customer_id = absint( $args['customer_id'] ?? 0 );
+        $status      = $args['status']      ?? 'all';
+
+        if ( $search !== '' ) {
+            $like         = '%' . $wpdb->esc_like( $search ) . '%';
+            $conditions[] = $wpdb->prepare(
+                '(alias_code LIKE %s OR ean8_code LIKE %s)',
+                $like, $like
+            );
+        }
+
+        if ( $customer_id ) {
+            $conditions[] = $wpdb->prepare( 'user_id = %d', $customer_id );
+        }
+
+        switch ( $status ) {
+            case 'active':
+                $conditions[] = 'is_active = 1 AND (expires_at IS NULL OR expires_at > NOW())';
+                break;
+            case 'disabled':
+                $conditions[] = 'is_active = 0';
+                break;
+            case 'expired':
+                $conditions[] = 'expires_at IS NOT NULL AND expires_at <= NOW()';
+                break;
+            // 'all': no extra condition
+        }
+
+        return $conditions;
+    }
+
+    // -------------------------------------------------------------------------
     // Admin list helpers
     // -------------------------------------------------------------------------
 
+    /**
+     * Fetch paginated rows.
+     *
+     * @param array $args {
+     *   int    $per_page
+     *   int    $offset
+     *   string $search       LIKE on alias_code / ean8_code.
+     *   int    $customer_id  Filter by WP user ID.
+     *   string $status       all | active | disabled | expired.
+     *   string $orderby
+     *   string $order        ASC | DESC
+     * }
+     */
     public static function get_rows( array $args = [] ): array {
         global $wpdb;
-        $table   = self::table();
-        $orderby = sanitize_sql_orderby( $args['orderby'] ?? 'id' ) ?: 'id';
-        $order   = strtoupper( $args['order'] ?? 'ASC' ) === 'DESC' ? 'DESC' : 'ASC';
-        $limit   = absint( $args['per_page'] ?? 20 );
-        $offset  = absint( $args['offset']   ?? 0 );
-        $search  = $args['search'] ?? '';
-
-        $where = '';
-        if ( $search ) {
-            $where = $wpdb->prepare(
-                'WHERE alias_code LIKE %s OR ean8_code LIKE %s',
-                '%' . $wpdb->esc_like( $search ) . '%',
-                '%' . $wpdb->esc_like( $search ) . '%'
-            );
-        }
+        $table      = self::table();
+        $orderby    = sanitize_sql_orderby( $args['orderby'] ?? 'id' ) ?: 'id';
+        $order      = strtoupper( $args['order'] ?? 'ASC' ) === 'DESC' ? 'DESC' : 'ASC';
+        $limit      = absint( $args['per_page'] ?? 20 );
+        $offset     = absint( $args['offset']   ?? 0 );
+        $conditions = self::build_conditions( $args );
+        $where      = $conditions ? ( 'WHERE ' . implode( ' AND ', $conditions ) ) : '';
 
         return $wpdb->get_results(
             $wpdb->prepare(
@@ -84,22 +138,27 @@ class CIA_DB {
         ) ?: [];
     }
 
+    /**
+     * Count rows matching a simple search string.
+     * Kept for backward compatibility with CIA_List_Table.
+     */
     public static function count_rows( string $search = '' ): int {
+        return self::count_rows_filtered( [ 'search' => $search ] );
+    }
+
+    /**
+     * Count rows matching a full filter args array.
+     * Used by CIA_REST_API and any caller needing customer_id / status filters.
+     */
+    public static function count_rows_filtered( array $args = [] ): int {
         global $wpdb;
-        $table = self::table();
-        $where = '';
-
-        if ( $search ) {
-            $where = $wpdb->prepare(
-                'WHERE alias_code LIKE %s OR ean8_code LIKE %s',
-                '%' . $wpdb->esc_like( $search ) . '%',
-                '%' . $wpdb->esc_like( $search ) . '%'
-            );
-        }
-
+        $table      = self::table();
+        $conditions = self::build_conditions( $args );
+        $where      = $conditions ? ( 'WHERE ' . implode( ' AND ', $conditions ) ) : '';
         return (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table} {$where}" );
     }
 
+    /** Fetch a single row by ID (admin; no active/expiry filter). */
     public static function get_row( int $id ): ?array {
         global $wpdb;
         $table = self::table();
@@ -113,10 +172,6 @@ class CIA_DB {
     // Duplicate / conflict detection
     // -------------------------------------------------------------------------
 
-    /**
-     * Find an exact (user_id, alias_code, ean8_code) duplicate.
-     * Pass $exclude_id when editing so a row doesn't flag itself.
-     */
     public static function find_exact_duplicate(
         int $user_id,
         string $alias_code,
@@ -141,10 +196,6 @@ class CIA_DB {
         ) ?: null;
     }
 
-    /**
-     * Find all OTHER EAN mappings for a given (user_id, alias_code) pair.
-     * Non-empty result = multi-EAN alias (intentional, admin should be informed).
-     */
     public static function find_alias_mappings(
         int $user_id,
         string $alias_code,
@@ -295,13 +346,16 @@ class CIA_DB {
     }
 
     // -------------------------------------------------------------------------
-    // Write operations  (each one records an audit log entry)
+    // Write operations  (each records an audit log entry via CIA_Log)
     // -------------------------------------------------------------------------
 
     /**
-     * Insert a new alias record and log the creation.
+     * Insert a new alias record.
+     *
+     * @return int  New row ID on success, 0 on failure.
+     *              Truthy/falsy for backward-compatible callers that do if($ok).
      */
-    public static function insert( array $data ): bool {
+    public static function insert( array $data ): int {
         global $wpdb;
 
         $row = [
@@ -312,22 +366,25 @@ class CIA_DB {
             'expires_at' => $data['expires_at'] ?? null,
         ];
 
-        $ok = (bool) $wpdb->insert(
+        $inserted = $wpdb->insert(
             self::table(),
             $row,
             [ '%d', '%s', '%s', '%d', '%s' ]
         );
 
-        if ( $ok ) {
-            CIA_Log::record( 'created', array_merge( [ 'id' => $wpdb->insert_id ], $row ) );
+        if ( ! $inserted ) {
+            return 0;
         }
 
-        return $ok;
+        $new_id = (int) $wpdb->insert_id;
+        CIA_Log::record( 'created', array_merge( [ 'id' => $new_id ], $row ) );
+        return $new_id;
     }
 
     /**
      * Update an existing alias record.
-     * Fetches the old row before writing so the log captures a before/after diff.
+     * Returns true if the row was updated (including no-op updates where values
+     * are unchanged — wpdb::update returns 0 rows but no error in that case).
      */
     public static function update( int $id, array $data ): bool {
         global $wpdb;
@@ -342,7 +399,10 @@ class CIA_DB {
             'expires_at' => $data['expires_at'] ?? null,
         ];
 
-        $ok = (bool) $wpdb->update(
+        // wpdb::update returns int (rows affected) or false on error.
+        // !== false covers the case where values haven’t changed (0 rows affected)
+        // which is a valid successful no-op update, not an error.
+        $result = $wpdb->update(
             self::table(),
             $row,
             [ 'id' => $id ],
@@ -350,23 +410,20 @@ class CIA_DB {
             [ '%d' ]
         );
 
-        if ( $ok ) {
-            CIA_Log::record( 'updated', array_merge( [ 'id' => $id ], $row ), $old );
+        if ( $result === false ) {
+            return false;
         }
 
-        return $ok;
+        CIA_Log::record( 'updated', array_merge( [ 'id' => $id ], $row ), $old );
+        return true;
     }
 
-    /**
-     * Enable or disable a single alias record.
-     * Fetches the row before toggling so the log captures the state change.
-     */
+    /** Enable or disable a single alias record. */
     public static function set_active( int $id, bool $active ): bool {
         global $wpdb;
 
-        $old = self::get_row( $id );
-
-        $ok = (bool) $wpdb->update(
+        $old    = self::get_row( $id );
+        $result = $wpdb->update(
             self::table(),
             [ 'is_active' => $active ? 1 : 0 ],
             [ 'id'        => $id ],
@@ -374,27 +431,32 @@ class CIA_DB {
             [ '%d' ]
         );
 
-        if ( $ok && $old ) {
+        if ( $result === false ) {
+            return false;
+        }
+
+        if ( $old ) {
             $new = array_merge( $old, [ 'is_active' => $active ? 1 : 0 ] );
             CIA_Log::record( $active ? 'enabled' : 'disabled', $new, $old );
         }
 
-        return $ok;
+        return true;
     }
 
     /**
      * Hard-delete one or multiple alias records.
-     * Captures each row before deletion so the audit log preserves the data.
+     * Captures rows before deletion so the audit log preserves the data.
      *
      * @param int|int[] $ids
      */
     public static function delete( $ids ): void {
         global $wpdb;
         $table   = self::table();
-        $ids     = array_map( 'absint', (array) $ids );
+        $ids     = array_filter( array_map( 'absint', (array) $ids ) );
+        if ( empty( $ids ) ) return;
+
         $id_list = implode( ',', $ids );
 
-        // Capture rows before deletion for audit log
         $to_log = [];
         foreach ( $ids as $id ) {
             $row = self::get_row( $id );
