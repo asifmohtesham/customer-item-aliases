@@ -148,23 +148,32 @@ class CIA_Hooks {
         $user_id = $customer_id ?: get_current_user_id();
 
         if ( ! $user_id ) {
-            return [];
+            $ean_codes = [];
+        } else {
+            $is_admin = user_can( $user_id, 'manage_woocommerce' )
+                     || user_can( $user_id, 'manage_options' );
+
+            if ( $is_admin ) {
+                // Stage 1: exact, global
+                $codes = CIA_DB::resolve_aliases_global( $search );
+                // Stage 2: LIKE fallback, global
+                $ean_codes = $codes ?: CIA_DB::resolve_aliases_global_like( $search );
+            } else {
+                // Stage 1: exact, scoped
+                $codes = CIA_DB::resolve_aliases( $user_id, $search );
+                // Stage 2: LIKE fallback, scoped
+                $ean_codes = $codes ?: CIA_DB::resolve_aliases_like( $user_id, $search );
+            }
         }
 
-        $is_admin = user_can( $user_id, 'manage_woocommerce' )
-                 || user_can( $user_id, 'manage_options' );
-
-        if ( $is_admin ) {
-            // Stage 1: exact, global
-            $codes = CIA_DB::resolve_aliases_global( $search );
-            // Stage 2: LIKE fallback, global
-            return $codes ?: CIA_DB::resolve_aliases_global_like( $search );
-        }
-
-        // Stage 1: exact, scoped
-        $codes = CIA_DB::resolve_aliases( $user_id, $search );
-        // Stage 2: LIKE fallback, scoped
-        return $codes ?: CIA_DB::resolve_aliases_like( $user_id, $search );
+        /**
+         * Fire after alias resolution for analytics / logging.
+         *
+         * @param string[] $ean_codes   Resolved EAN codes (empty if not found).
+         * @param string   $search      The original search term.
+         * @param int|null $customer_id The customer who searched (null if anonymous).
+         */
+        return apply_filters( 'cia_after_resolve', $ean_codes, $search, $customer_id );
     }
 
     // -------------------------------------------------------------------------
