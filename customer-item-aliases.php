@@ -45,6 +45,12 @@ register_activation_hook( __FILE__, function () {
     CIA_DB::create_table();
     CIA_Log::create_table();
     CIA_Search_Stats::create_table();
+    CIA_Log::schedule_pruning();  // ITEM #10: Schedule daily log pruning
+} );
+
+// --- Deactivation ---
+register_deactivation_hook( __FILE__, function () {
+    CIA_Log::unschedule_pruning();  // ITEM #10: Remove cron event
 } );
 
 // --- Bootstrap ---
@@ -60,3 +66,6 @@ add_action( 'plugins_loaded', function () {
     CIA_Search_Stats::init();
     CIA_Order_Notes::init();
 } );
+
+// ITEM #10: Register cron hook for automated log pruning
+add_action( 'cia_daily_log_prune', [ 'CIA_Log', 'run_scheduled_pruning' ] );

@@ -187,6 +187,17 @@ class CIA_Admin {
         $top_terms   = CIA_Search_Stats::get_top_terms( $args );
         $unresolved  = CIA_Search_Stats::get_unresolved( $args );
 
+        // ITEM #8: Enrich unresolved searches with customer names
+        $unresolved = array_map( static function( $row ) {
+            if ( ! empty( $row['user_id'] ) ) {
+                $user = get_userdata( (int) $row['user_id'] );
+                $row['customer_name'] = $user ? $user->display_name : '';
+            } else {
+                $row['customer_name'] = '';
+            }
+            return $row;
+        }, $unresolved );
+
         wp_send_json( [
             'top_terms'  => $top_terms,
             'unresolved' => $unresolved,
@@ -461,6 +472,15 @@ class CIA_Admin {
             if ( ! preg_match( '/^\d{8}$/', $ean8_code ) ) {
                 $stats['errors'][] = sprintf(
                     __( 'Row %1$d: ean8_code "%2$s" must be exactly 8 digits.', 'customer-item-aliases' ),
+                    $row_num, $ean8_code
+                );
+                continue;
+            }
+
+            // ITEM #9: Validate EAN exists in product catalog
+            if ( ! CIA_DB::ean_exists_in_catalog( $ean8_code ) ) {
+                $stats['errors'][] = sprintf(
+                    __( 'Row %1$d: EAN "%2$s" not found in product catalog.', 'customer-item-aliases' ),
                     $row_num, $ean8_code
                 );
                 continue;
@@ -751,10 +771,10 @@ class CIA_Admin {
                         html += '<h2 style="margin-top:30px;">❌ Unresolved Searches (Most Recent)</h2>';
                         html += '<table class="wp-list-table widefat fixed striped"><thead><tr><th>Term</th><th>Customer</th><th>Searched At</th></tr></thead><tbody>';
                         data.unresolved.forEach(function(u){
-                            var userName = u.user_id ? ('Customer ' + u.user_id) : 'Anonymous';
+                            var userName = u.customer_name || (u.user_id ? ('Customer ' + u.user_id) : 'Anonymous');
                             html += '<tr>';
                             html += '<td><strong>' + $('<span>').text(u.search_term).html() + '</strong></td>';
-                            html += '<td>' + userName + '</td>';
+                            html += '<td>' + $('<span>').text(userName).html() + '</td>';
                             html += '<td>' + u.searched_at + '</td>';
                             html += '</tr>';
                         });

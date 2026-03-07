@@ -12,7 +12,7 @@ defined( 'ABSPATH' ) || exit;
  * +--------------+------------------------------------------+
  * | alias_id     | affected alias row ID (preserved on del) |
  * | action       | created|updated|deleted|enabled|disabled  |
- * | customer_id  | alias owner’s WP user ID                 |
+ * | customer_id  | alias owner's WP user ID                 |
  * | alias_code   | snapshot at time of action               |
  * | ean8_code    | snapshot at time of action               |
  * | old_values   | JSON of row BEFORE change (null=create)  |
@@ -89,7 +89,7 @@ class CIA_Log {
     ): void {
         global $wpdb;
 
-        // Silently bail if the log table doesn’t exist yet (e.g. mid-upgrade)
+        // Silently bail if the log table doesn't exist yet (e.g. mid-upgrade)
         if ( ! $wpdb->get_var( "SHOW TABLES LIKE '" . self::log_table() . "'" ) ) {
             return;
         }
@@ -172,6 +172,45 @@ class CIA_Log {
                 "DELETE FROM " . self::log_table() . "
                  WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)",
                 $days
+            )
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // ITEM #10: Automated log pruning via WP-Cron
+    // -------------------------------------------------------------------------
+
+    /**
+     * Schedule the daily log pruning cron event.
+     * Called automatically on plugin activation.
+     */
+    public static function schedule_pruning(): void {
+        if ( ! wp_next_scheduled( 'cia_daily_log_prune' ) ) {
+            wp_schedule_event( time(), 'daily', 'cia_daily_log_prune' );
+        }
+    }
+
+    /**
+     * Unschedule the daily log pruning cron event.
+     * Called automatically on plugin deactivation.
+     */
+    public static function unschedule_pruning(): void {
+        $timestamp = wp_next_scheduled( 'cia_daily_log_prune' );
+        if ( $timestamp ) {
+            wp_unschedule_event( $timestamp, 'cia_daily_log_prune' );
+        }
+    }
+
+    /**
+     * WP-Cron callback: purge logs older than 90 days.
+     * Hooked to 'cia_daily_log_prune' action.
+     */
+    public static function run_scheduled_pruning(): void {
+        $deleted = self::purge_old( 90 );
+        error_log(
+            sprintf(
+                '[CIA] Automated log pruning completed. %d entries deleted.',
+                $deleted
             )
         );
     }
