@@ -19,8 +19,12 @@ class CIA_Log_Table extends WP_List_Table {
     /** Tracked fields shown in the Changes diff column. */
     private const DIFF_FIELDS = [ 'alias_code', 'ean8_code', 'is_active', 'expires_at', 'user_id' ];
 
-    /** Badge colours per action. */
-    private const ACTION_COLORS = [
+    /**
+     * Badge colours per action.
+     * Public so CIA_Log_Admin can reference it when rendering the filter tabs
+     * without duplicating the colour definitions.
+     */
+    public const ACTION_COLORS = [
         'created'  => [ 'bg' => '#00a32a', 'label' => 'CREATED'  ],
         'updated'  => [ 'bg' => '#0073aa', 'label' => 'UPDATED'  ],
         'deleted'  => [ 'bg' => '#d63638', 'label' => 'DELETED'  ],
@@ -69,11 +73,11 @@ class CIA_Log_Table extends WP_List_Table {
         $current_page = $this->get_pagenum();
 
         $args = [
-            'search'        => sanitize_text_field( $_GET['s']          ?? '' ),
-            'action_filter' => sanitize_key(        $_GET['log_action'] ?? '' ),
+            'search'        => sanitize_text_field( $_GET['s']            ?? '' ),
+            'action_filter' => sanitize_key(        $_GET['log_action']   ?? '' ),
             'customer_id'   => absint(              $_GET['log_customer'] ?? 0 ),
-            'orderby'       => sanitize_key(        $_GET['orderby']    ?? 'id' ),
-            'order'         => sanitize_key(        $_GET['order']      ?? 'desc' ),
+            'orderby'       => sanitize_key(        $_GET['orderby']      ?? 'id' ),
+            'order'         => sanitize_key(        $_GET['order']        ?? 'desc' ),
             'per_page'      => $per_page,
             'offset'        => ( $current_page - 1 ) * $per_page,
         ];
@@ -96,9 +100,9 @@ class CIA_Log_Table extends WP_List_Table {
     }
 
     public function column_created_at( $item ): string {
-        $ts     = strtotime( $item['created_at'] );
-        $date   = wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $ts );
-        $ago    = human_time_diff( $ts, time() );
+        $ts   = strtotime( $item['created_at'] );
+        $date = wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $ts );
+        $ago  = human_time_diff( $ts, time() );
         return sprintf(
             '<span title="%s">%s</span><br><small style="color:#666;">%s ago</small>',
             esc_attr( $item['created_at'] ),
@@ -149,8 +153,10 @@ class CIA_Log_Table extends WP_List_Table {
     public function column_performed_by( $item ): string {
         $uid  = absint( $item['performed_by'] );
         $user = $uid ? get_userdata( $uid ) : null;
-        $name = $user ? esc_html( $user->display_name ) : ( $uid ? sprintf( '<em>#%d</em>', $uid ) : '<em>system</em>' );
-        $ip   = ! empty( $item['ip_address'] )
+        $name = $user
+            ? esc_html( $user->display_name )
+            : ( $uid ? sprintf( '<em>#%d</em>', $uid ) : '<em>system</em>' );
+        $ip = ! empty( $item['ip_address'] )
             ? sprintf( '<br><small style="color:#999;">%s</small>', esc_html( $item['ip_address'] ) )
             : '';
         return $name . $ip;
@@ -170,7 +176,6 @@ class CIA_Log_Table extends WP_List_Table {
             $n = (string) ( $new[ $field ] ?? '' );
             if ( $o === $n ) continue;
 
-            // Human-friendly labels
             $label = match ( $field ) {
                 'is_active'  => 'Status',
                 'expires_at' => 'Expires',
@@ -178,7 +183,6 @@ class CIA_Log_Table extends WP_List_Table {
                 default      => $field,
             };
 
-            // For is_active show On/Off instead of 1/0
             if ( $field === 'is_active' ) {
                 $o = $o === '1' ? 'Active' : 'Disabled';
                 $n = $n === '1' ? 'Active' : 'Disabled';
