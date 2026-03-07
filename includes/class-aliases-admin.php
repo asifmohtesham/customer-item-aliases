@@ -58,24 +58,6 @@ class CIA_Admin {
     // AJAX: Real-time duplicate / conflict check
     // -------------------------------------------------------------------------
 
-    /**
-     * Checks for duplicate or conflicting alias mappings while the admin
-     * fills in the Add/Edit form. Called on every keystroke (debounced 500ms).
-     *
-     * Request params (POST):
-     *   user_id    — customer's WordPress user ID
-     *   alias_code — alias being entered
-     *   ean8_code  — EAN being entered (may be partial/empty)
-     *   id         — current row ID when editing (0 when adding)
-     *
-     * Response JSON:
-     * {
-     *   "exact_duplicate":   false,          // identical triple already exists
-     *   "existing_mappings": [               // other EANs for same alias+customer
-     *     { "id": 5, "ean8_code": "30000070", "is_active": "1", "expires_at": null }
-     *   ]
-     * }
-     */
     public static function ajax_check_alias(): void {
         check_ajax_referer( 'cia_check_alias', 'nonce' );
 
@@ -88,7 +70,6 @@ class CIA_Admin {
         $ean8_code  = sanitize_text_field( $_POST['ean8_code']  ?? '' );
         $exclude_id = absint( $_POST['id']         ?? 0 );
 
-        // Need at least user + alias to run a meaningful check
         if ( ! $user_id || $alias_code === '' ) {
             wp_send_json( [ 'exact_duplicate' => false, 'existing_mappings' => [] ] );
             return;
@@ -127,11 +108,16 @@ class CIA_Admin {
     // -------------------------------------------------------------------------
 
     public static function handle_actions(): void {
-        $page   = sanitize_key( $_REQUEST['page']  ?? '' );
-        $action = sanitize_key( $_REQUEST['action'] ?? '' );
-
+        $page = sanitize_key( $_REQUEST['page'] ?? '' );
         if ( $page !== 'cia-aliases' ) return;
         if ( ! current_user_can( 'manage_woocommerce' ) ) wp_die( 'Unauthorized' );
+
+        // Resolve action: top dropdown sends 'action', bottom sends 'action2'.
+        // WP uses '-1' as the "no action selected" sentinel for both dropdowns.
+        $action = sanitize_key( $_REQUEST['action'] ?? '' );
+        if ( $action === '' || $action === '-1' ) {
+            $action = sanitize_key( $_REQUEST['action2'] ?? '' );
+        }
 
         // --- CSV Export ---
         if ( $action === 'export' ) {
@@ -168,13 +154,27 @@ class CIA_Admin {
         }
 
         // --- Bulk actions ---
-        if ( ! empty( $_POST['alias_ids'] ) ) {
+        // WP_List_Table nonce: action = 'bulk-aliases', field = '_wpnonce'.
+        // alias_ids[] is the checkbox array from column_cb().
+        if ( ! empty( $_POST['alias_ids'] ) && in_array( $action, [ 'bulk-delete', 'bulk-enable', 'bulk-disable' ], true ) ) {
             check_admin_referer( 'bulk-aliases' );
-            $ids = array_map( 'absint', $_POST['alias_ids'] );
 
-            if ( $action === 'bulk-delete'  ) { CIA_DB::delete( $ids ); self::redirect( 'bulk_deleted' ); }
-            if ( $action === 'bulk-enable'  ) { foreach ( $ids as $id ) CIA_DB::set_active( $id, true );  self::redirect( 'bulk_enabled' );  }
-            if ( $action === 'bulk-disable' ) { foreach ( $ids as $id ) CIA_DB::set_active( $id, false ); self::redirect( 'bulk_disabled' ); }
+            $ids = array_filter( array_map( 'absint', (array) $_POST['alias_ids'] ) );
+            if ( empty( $ids ) ) self::redirect( 'no_selection' );
+
+            switch ( $action ) {
+                case 'bulk-delete':
+                    CIA_DB::delete( $ids );
+                    self::redirect( 'bulk_deleted' );
+
+                case 'bulk-enable':
+                    foreach ( $ids as $id ) CIA_DB::set_active( $id, true );
+                    self::redirect( 'bulk_enabled' );
+
+                case 'bulk-disable':
+                    foreach ( $ids as $id ) CIA_DB::set_active( $id, false );
+                    self::redirect( 'bulk_disabled' );
+            }
         }
 
         // --- Save (add / edit) ---
@@ -195,28 +195,18 @@ class CIA_Admin {
             if ( ! $data['user_id'] )                              self::redirect( 'no_user' );
             if ( ! preg_match( '/^\d{8}$/', $data['ean8_code'] ) ) self::redirect( 'invalid_ean8' );
 
-            // ── Guard 1: Block exact duplicates ──────────────────────────────────────
-            // An exact (user_id, alias_code, ean8_code) triple must be unique.
-            // $id is passed so a row being edited doesn't flag itself.
+            // Block exact duplicates
             $duplicate = CIA_DB::find_exact_duplicate(
                 $data['user_id'],
                 $data['alias_code'],
                 $data['ean8_code'],
                 $id
             );
-            if ( $duplicate ) {
-                self::redirect( 'duplicate_alias' );
-            }
+            if ( $duplicate ) self::redirect( 'duplicate_alias' );
 
-            // ── Guard 2: Detect multi-EAN alias (warn, but allow) ───────────────
-            // If other EAN mappings exist for this alias+customer, the save
-            // succeeds but the admin is shown an informational notice afterwards.
-            $pre_existing = CIA_DB::find_alias_mappings(
-                $data['user_id'],
-                $data['alias_code'],
-                $id
-            );
-            $is_multi = count( $pre_existing ) > 0;
+            // Detect multi-EAN alias (allowed, but inform admin after save)
+            $pre_existing = CIA_DB::find_alias_mappings( $data['user_id'], $data['alias_code'], $id );
+            $is_multi     = count( $pre_existing ) > 0;
 
             $id ? CIA_DB::update( $id, $data ) : CIA_DB::insert( $data );
             self::redirect( $is_multi ? 'saved_multi' : 'saved' );
@@ -428,8 +418,19 @@ class CIA_Admin {
                 <?php esc_html_e( 'Add New', 'customer-item-aliases' ); ?>
             </a>
             <hr class="wp-header-end">
+
             <?php self::render_import_export_panels(); ?>
-            <form method="get">
+
+            <?php
+            /*
+             * The form MUST be method="post" so bulk action checkboxes (alias_ids[])
+             * and the WP_List_Table nonce reach $_POST.
+             * The search_box() and pagination links are GET-param URLs that work
+             * independently of the form method.
+             */
+            ?>
+            <form method="post" action="<?php echo esc_url( admin_url( 'admin.php' ) ); ?>"
+                  id="cia-list-form">
                 <input type="hidden" name="page" value="cia-aliases" />
                 <?php
                     $table->search_box( __( 'Search Aliases', 'customer-item-aliases' ), 'alias' );
@@ -437,6 +438,29 @@ class CIA_Admin {
                 ?>
             </form>
         </div>
+
+        <script>
+        jQuery(function($){
+            $('#cia-list-form').on('submit', function(e){
+                // Resolve which dropdown fired (top = 'action', bottom = 'action2')
+                var a1 = $('[name="action"]',  this).val();
+                var a2 = $('[name="action2"]', this).val();
+                var action = (a1 && a1 !== '-1') ? a1 : a2;
+
+                if (action === 'bulk-delete') {
+                    var count = $('input[name="alias_ids[]"]:checked', this).length;
+                    if (count === 0) { e.preventDefault(); return; }
+                    if (!confirm(
+                        count === 1
+                            ? '<?php echo esc_js( __( 'Permanently delete 1 selected alias? This cannot be undone.', 'customer-item-aliases' ) ); ?>'
+                            : count + ' <?php echo esc_js( __( 'selected aliases will be permanently deleted. This cannot be undone. Continue?', 'customer-item-aliases' ) ); ?>'
+                    )) {
+                        e.preventDefault();
+                    }
+                }
+            });
+        });
+        </script>
         <?php
     }
 
@@ -493,7 +517,7 @@ class CIA_Admin {
                         </label>
                         <select name="customer_id" id="cia-export-customer"
                                 style="min-width:220px;max-width:100%;margin-bottom:10px;">
-                            <option value="0"><?php esc_html_e( '— All Customers —', 'customer-item-aliases' ); ?></option>
+                            <option value="0"><?php esc_html_e( '\u2014 All Customers \u2014', 'customer-item-aliases' ); ?></option>
                             <?php foreach ( $customers as $uid ) : ?>
                                 <?php $u = get_userdata( $uid ); if ( ! $u ) continue; ?>
                                 <option value="<?php echo absint( $uid ); ?>">
@@ -538,7 +562,6 @@ class CIA_Admin {
             }
         }
 
-        // Inject both Select2 data and alias-check nonce before the script
         wp_add_inline_script( 'select2',
             'var ciaCustomerSelect = ' . wp_json_encode( [
                 'ajaxUrl'     => admin_url( 'admin-ajax.php' ),
@@ -546,7 +569,7 @@ class CIA_Admin {
                 'placeholder' => __( '\u2014 Search by name or email \u2014', 'customer-item-aliases' ),
                 'preselected' => $preselected,
             ] ) . ';' .
-            'var ciaAliasCheck = '   . wp_json_encode( [
+            'var ciaAliasCheck = ' . wp_json_encode( [
                 'ajaxUrl' => admin_url( 'admin-ajax.php' ),
                 'nonce'   => wp_create_nonce( 'cia_check_alias' ),
             ] ) . ';',
@@ -636,7 +659,7 @@ class CIA_Admin {
                             <input type="datetime-local" name="expires_at" id="expires_at"
                                    value="<?php echo esc_attr( $expires_at_input ); ?>" />
                             <p class="description">
-                                <?php esc_html_e( 'Optional. Leave blank for no expiry. After this date/time the alias stops resolving automatically.', 'customer-item-aliases' ); ?>
+                                <?php esc_html_e( 'Optional. Leave blank for no expiry.', 'customer-item-aliases' ); ?>
                             </p>
                         </td>
                     </tr>
@@ -698,15 +721,6 @@ class CIA_Admin {
     // Real-time duplicate / conflict check script
     // -------------------------------------------------------------------------
 
-    /**
-     * Watches the Customer, Alias Code, and EAN8 fields.
-     * After a 500ms debounce it fires an AJAX call to cia_check_alias and
-     * renders an inline notice in the form:
-     *
-     *   ❌ Red   — exact duplicate (save will be blocked server-side)
-     *   ⚠️ Amber — alias already maps to other EAN(s); save creates a multi-EAN alias
-     *   (none) — no conflicts found
-     */
     private static function get_duplicate_check_script(): string {
         return <<<'JS'
         jQuery(function ($) {
@@ -767,7 +781,7 @@ class CIA_Admin {
                             .join(', ');
                         showNotice('warning',
                             '<strong>Note:</strong> This alias already maps to EAN ' + eans +
-                            ' for this customer. Saving will create a second mapping (multi-EAN alias — both products will appear in search results).'
+                            ' for this customer. Saving will create a second mapping (multi-EAN alias).'
                         );
                         return;
                     }
@@ -784,7 +798,6 @@ class CIA_Admin {
             $('#alias_code, #ean8_code').on('input', triggerCheck);
             $('#cia-customer-select').on('change', triggerCheck);
 
-            // Run immediately on page load when editing an existing row
             if ($('input[name="id"]').val() > 0) {
                 runCheck();
             }
@@ -800,7 +813,6 @@ class CIA_Admin {
         $msg_key = sanitize_key( $_GET['cia_msg'] ?? '' );
         if ( ! $msg_key ) return;
 
-        // Dynamic import result (transient)
         if ( $msg_key === 'imported' ) {
             $uid   = get_current_user_id();
             $stats = get_transient( 'cia_import_result_' . $uid );
@@ -810,26 +822,24 @@ class CIA_Admin {
         }
 
         $messages = [
-            // Success
-            'saved'                   => [ 'success', __( 'Alias saved successfully.',                                                       'customer-item-aliases' ) ],
-            'saved_multi'             => [ 'info',    __( 'Alias saved. This alias now maps to multiple EAN codes for this customer.',       'customer-item-aliases' ) ],
-            'deleted'                 => [ 'success', __( 'Alias deleted.',                                                                  'customer-item-aliases' ) ],
-            'enabled'                 => [ 'success', __( 'Alias enabled.',                                                                  'customer-item-aliases' ) ],
-            'disabled'                => [ 'success', __( 'Alias disabled.',                                                                 'customer-item-aliases' ) ],
-            'bulk_deleted'            => [ 'success', __( 'Selected aliases deleted.',                                                       'customer-item-aliases' ) ],
-            'bulk_enabled'            => [ 'success', __( 'Selected aliases enabled.',                                                       'customer-item-aliases' ) ],
-            'bulk_disabled'           => [ 'success', __( 'Selected aliases disabled.',                                                      'customer-item-aliases' ) ],
-            // Errors — form validation
-            'no_user'                 => [ 'error',   __( 'Please select a customer.',                                                       'customer-item-aliases' ) ],
-            'invalid_ean8'            => [ 'error',   __( 'EAN8 must be exactly 8 digits.',                                                  'customer-item-aliases' ) ],
-            'duplicate_alias'         => [ 'error',   __( 'This exact alias mapping already exists for this customer. No changes were saved.', 'customer-item-aliases' ) ],
-            // Errors — import
-            'no_file'                 => [ 'error',   __( 'No file selected or upload failed.',                                              'customer-item-aliases' ) ],
-            'invalid_file_type'       => [ 'error',   __( 'Please upload a .csv file.',                                                      'customer-item-aliases' ) ],
-            'import_read_error'       => [ 'error',   __( 'Could not read the uploaded file.',                                               'customer-item-aliases' ) ],
-            'import_empty'            => [ 'error',   __( 'The CSV file is empty.',                                                          'customer-item-aliases' ) ],
-            'import_missing_user_col' => [ 'error',   __( 'CSV must include a user_id or customer_email column.',                            'customer-item-aliases' ) ],
-            'import_missing_cols'     => [ 'error',   __( 'CSV must include alias_code and ean8_code columns.',                              'customer-item-aliases' ) ],
+            'saved'                   => [ 'success', __( 'Alias saved successfully.',                                                             'customer-item-aliases' ) ],
+            'saved_multi'             => [ 'info',    __( 'Alias saved. This alias now maps to multiple EAN codes for this customer.',             'customer-item-aliases' ) ],
+            'deleted'                 => [ 'success', __( 'Alias deleted.',                                                                        'customer-item-aliases' ) ],
+            'enabled'                 => [ 'success', __( 'Alias enabled.',                                                                        'customer-item-aliases' ) ],
+            'disabled'                => [ 'success', __( 'Alias disabled.',                                                                       'customer-item-aliases' ) ],
+            'bulk_deleted'            => [ 'success', __( 'Selected aliases deleted.',                                                             'customer-item-aliases' ) ],
+            'bulk_enabled'            => [ 'success', __( 'Selected aliases enabled.',                                                             'customer-item-aliases' ) ],
+            'bulk_disabled'           => [ 'success', __( 'Selected aliases disabled.',                                                            'customer-item-aliases' ) ],
+            'no_selection'            => [ 'warning', __( 'No aliases selected. Please check at least one row before applying a bulk action.',     'customer-item-aliases' ) ],
+            'no_user'                 => [ 'error',   __( 'Please select a customer.',                                                             'customer-item-aliases' ) ],
+            'invalid_ean8'            => [ 'error',   __( 'EAN8 must be exactly 8 digits.',                                                        'customer-item-aliases' ) ],
+            'duplicate_alias'         => [ 'error',   __( 'This exact alias mapping already exists for this customer. No changes were saved.',     'customer-item-aliases' ) ],
+            'no_file'                 => [ 'error',   __( 'No file selected or upload failed.',                                                    'customer-item-aliases' ) ],
+            'invalid_file_type'       => [ 'error',   __( 'Please upload a .csv file.',                                                            'customer-item-aliases' ) ],
+            'import_read_error'       => [ 'error',   __( 'Could not read the uploaded file.',                                                     'customer-item-aliases' ) ],
+            'import_empty'            => [ 'error',   __( 'The CSV file is empty.',                                                                'customer-item-aliases' ) ],
+            'import_missing_user_col' => [ 'error',   __( 'CSV must include a user_id or customer_email column.',                                  'customer-item-aliases' ) ],
+            'import_missing_cols'     => [ 'error',   __( 'CSV must include alias_code and ean8_code columns.',                                    'customer-item-aliases' ) ],
         ];
 
         if ( isset( $messages[ $msg_key ] ) ) {
